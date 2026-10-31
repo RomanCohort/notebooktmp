@@ -1,0 +1,21 @@
+[Unit]
+Description=RNAQwen v3 SOS-LoRA training
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rnaqwen
+Group=rnaqwen
+WorkingDirectory=/opt/RNAQwen
+Environment=RNAQ_ENV_FILE=/etc/rnaqwen/train.env
+ExecStart=/opt/RNAQwen/deploy/run_train.sh
+Restart=on-failure
+RestartSec=120
+TimeoutStopSec=300
+KillSignal=SIGTERM
+LimitNOFILE=1048576
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
