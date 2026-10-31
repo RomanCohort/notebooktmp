@@ -1,5 +1,7 @@
 # RNAQwen v3 Colab
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/RomanCohort/notebooktmp/blob/main/RNAQwen_v3_Full.ipynb)
+
 Open `RNAQwen_v3_Full.ipynb` in Google Colab and select an A100 40GB runtime.
 No Google Drive is required.
 
@@ -34,3 +36,8 @@ release tagged `train-v3-checkpoints`.
 
 The hidden-state cache is runtime-local because it is too large for a GitHub
 repository. A fresh Colab runtime must regenerate it before resuming training.
+
+## Released assets
+
+- Dataset: https://github.com/RomanCohort/notebooktmp/releases/tag/dataset-v3
+- Checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/train-v3-checkpoints
