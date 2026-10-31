@@ -1012,7 +1012,7 @@ def main() -> int:
         dc = torch.load(args.codes_idx, map_location="cpu", weights_only=False)
         mmc = np.memmap(args.codes, dtype=np.uint16, mode="r",
                         shape=(int(dc["n_pos"]),))
-        CODES = torch.from_numpy(mmc)
+        CODES = torch.from_numpy(mmc).clone()
         CODE_IDX = {
             uid: ("codes", int(dc["offsets"][i]), int(dc["lens"][i]))
             for i, uid in enumerate(dc["uids"])
@@ -1433,7 +1433,7 @@ def main() -> int:
             l_ent = (u * (u + 1e-9).log()).sum() * args.ent_coef    # 最小化 -> 最大化熵
         else:
             l_ent = torch.zeros((), device=DEV)
-        if t_all:
+        if not args.codes:
             l_com = args.commit_coef * F.mse_loss(torch.cat(t_all), torch.cat(q_all))
         else:
             l_com = torch.zeros((), device=DEV)
