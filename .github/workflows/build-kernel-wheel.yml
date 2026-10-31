@@ -59,6 +59,7 @@ jobs:
           TORCH_CUDA_ARCH_LIST: "8.0+PTX"
           CAUSAL_CONV1D_FORCE_BUILD: "TRUE"
           CAUSAL_CONV1D_FORCE_CXX11_ABI: "TRUE"
+          CAUSAL_CONV1D_LOCAL_VERSION: "cu13torch2.11cxx11abiTRUE"
         run: |
           git clone --depth 1 --branch v1.7.0 \
             https://github.com/Dao-AILab/causal-conv1d.git /tmp/causal-conv1d
