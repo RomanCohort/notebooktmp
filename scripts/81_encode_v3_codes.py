@@ -124,10 +124,27 @@ def main() -> int:
 
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if bool(state.get("sort_by_length", False)) != bool(args.sort_by_length):
+        expected = {
+            "dataset_sha256": data_sha,
+            "fsq_sha256": fsq_sha,
+            "total_positions": total,
+            "vocab": vocab,
+            "pool": args.pool,
+            "sort_by_length": bool(args.sort_by_length),
+        }
+        mismatch = {
+            k: (state.get(k), v) for k, v in expected.items()
+            if state.get(k) != v
+        }
+        if mismatch:
             raise RuntimeError(
-                "state was created with a different --sort-by-length setting; "
-                "rerun with --restart"
+                f"unfinished state does not match current inputs: {mismatch}. "
+                "Refusing to splice old and new caches; rerun with --restart."
+            )
+        if not out.exists() or out.stat().st_size != total * 2:
+            raise RuntimeError(
+                f"resume cache size is invalid: {out.stat().st_size if out.exists() else 'missing'} "
+                f"!= {total * 2}; rerun with --restart"
             )
         start = int(state["next_index"])
         pos = int(state["positions"])
@@ -145,6 +162,7 @@ def main() -> int:
             total_positions=total, vocab=vocab,
             dataset=str(data_path), dataset_sha256=data_sha,
             fsq=str(fsq_path), fsq_sha256=fsq_sha,
+            pool=args.pool,
             sort_by_length=bool(args.sort_by_length),
         ))
 
@@ -214,6 +232,7 @@ def main() -> int:
                     total_positions=total, vocab=vocab,
                     dataset=str(data_path), dataset_sha256=data_sha,
                     fsq=str(fsq_path), fsq_sha256=fsq_sha,
+                    pool=args.pool,
                     sort_by_length=bool(args.sort_by_length),
                 ))
             base = done

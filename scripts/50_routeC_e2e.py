@@ -34,6 +34,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNS_DIR = Path(os.environ.get("RNAQ_RUNS_DIR", str(ROOT / "runs")))
 sys.path.insert(0, str(ROOT / "src"))
 
 import rnaqwen  # noqa: F401,E402
@@ -43,6 +44,7 @@ import torch.nn.functional as F  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_NT = 1024
+EARLY_METRIC = "answer_masked_ce_v1"
 # LATENT/LEVELS 的**单一真相来源是 checkpoints/fsq_full/tokenizer.pt**，
 # 在 main 里读出来覆盖。硬编码会跟磁盘产物漂移 —— 表现是
 # `assert w.shape == model.rna_emb.weight.shape` 失败，日志只有一行 [tau] 看得出端倪。
@@ -77,6 +79,14 @@ def slice_hid(uid):
 POOL = 4          # 由 --pool 覆盖；per_token_logp 也要用，所以放模块级
 TAU = 4.0         # 软分配温度；0 时由 --tau 自动取 latent/2
 FSQ_CKPT = ROOT / "checkpoints/fsq_full/tokenizer.pt"
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(16 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------- FSQ
@@ -439,6 +449,7 @@ def per_token_logp(model, tk, examples, hid, perm=None, mode="real", max_n=25):
     perm != None 时：把码 c 换成 perm[c]（随机双射）。表、边缘分布、尺度全不变，
     只切断「码 <-> 内容」的对应。这是本脚本最关键的仪器。
     """
+    examples = spread(examples, max_n)
     real_table = model.rna_emb.weight.detach().clone() if model.rna_emb is not None else None
     if mode == "zero" and model.rna_emb is not None:
         model.rna_emb.weight.zero_()
@@ -450,7 +461,7 @@ def per_token_logp(model, tk, examples, hid, perm=None, mode="real", max_n=25):
         model.rna_emb.weight.copy_(real_table[0].expand_as(real_table).clone())
 
     out, out_ans, used = [], [], set()
-    for r, qa, clen, off in examples[:max_n]:
+    for r, qa, clen, off in examples:
         v, code, _, _ = vectors_for_uid(model, r["uid"], perm=perm, tau=TAU)
         used |= set(code.tolist())
         ids, lab, am = build_batch(tk, [(r, qa, clen, off)])
@@ -514,6 +525,40 @@ def spread(ex_list, n):
     return [ex_list[min(int(i * step), len(ex_list) - 1)] for i in range(n)]
 
 
+def sample_batches(bucket_indices, eff_len, batch_size, token_budget, seed):
+    """Yield token-packed batches; each row appears once per epoch.
+
+    The old sampler drew every row with replacement.  With 46,500 steps that
+    repeated some rows many times while leaving a large part of train unseen.
+    Bucket order and within-bucket order are shuffled, but the cursor advances
+    without replacement until the epoch is exhausted.
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    while True:
+        for bi in torch.randperm(len(bucket_indices), generator=gen).tolist():
+            bucket = bucket_indices[bi]
+            order = torch.randperm(len(bucket), generator=gen).tolist()
+            cur, tot, mx = [], 0, 0
+            for j in order:
+                i = bucket[j]
+                eff = eff_len[i]
+                nmx = max(mx, eff)
+                if cur and (tot + eff > token_budget
+                            or nmx * (len(cur) + 1) > token_budget):
+                    yield cur
+                    cur, tot, mx = [], 0, 0
+                    nmx = eff
+                cur.append(i)
+                tot += eff
+                mx = nmx
+                if len(cur) >= batch_size:
+                    yield cur
+                    cur, tot, mx = [], 0, 0
+            if cur:
+                yield cur
+
+
 @torch.no_grad()
 def val_ce(model, tk, ex_list, arm="A", max_n=25):
     """val 上答案 token 的**逐样本平均** CE，以及它的标准误。
@@ -542,9 +587,10 @@ def val_ce(model, tk, ex_list, arm="A", max_n=25):
         lg = model.llm(inputs_embeds=emb, attention_mask=am).logits.float()[:, :-1]
         tgt = lab[:, 1:]
         m = tgt >= 0
-        if m.sum():
+        answer_mask = answer_token_mask(tk, qa, lab)[:, 1:] & m
+        if answer_mask.any():
             lp = F.log_softmax(lg, -1).gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            per_ex.append(float(-lp[m].mean()))
+            per_ex.append(float(-lp[answer_mask].mean()))
     if not per_ex:
         return float("nan"), float("nan")
     mu = sum(per_ex) / len(per_ex)
@@ -560,7 +606,7 @@ def val_ce(model, tk, ex_list, arm="A", max_n=25):
 
 @torch.no_grad()
 def _logp_of(model, tk, ex_list):
-    """teacher-forced 答案 token 的 logp，逐条。返回 (tensor, 用到的码集合)。
+    """teacher-forced 答案 token 的 logp 与码频次。
 
     **必须传 uid。** `off` 是该记录在自己那份缓存内部的偏移：
     rfam/rfa 的 off 指向副缓存（最大 4700 万），而 hid_slice 不传 uid 时会退回
@@ -568,7 +614,7 @@ def _logp_of(model, tk, ex_list):
     之前这里漏了 uid，因为 diagnose 只取 ev_ex[:40]、而数据文件恰好把 seq8
     写在最前面（主缓存），所以一直没暴露。
     """
-    out, used = [], set()
+    out, code_freq = [], {}
     for r, qa, clen, off in ex_list:
         v, code, _, _ = vectors_for_uid(model, r.get("uid"), tau=TAU)
         if len(v) != clen:
@@ -576,16 +622,18 @@ def _logp_of(model, tk, ex_list):
                 f"RNA code length mismatch: got {len(v)}, placeholder expects {clen} "
                 f"(uid={r.get('uid')})"
             )
-        used |= set(code.tolist())
+        for c in code.tolist():
+            code_freq[c] = code_freq.get(c, 0) + 1
         ids, lab, am = build_batch(tk, [(r, qa, clen, off)])
         emb = model.embed(ids, v)
         lg = model.llm(inputs_embeds=emb, attention_mask=am).logits.float()[:, :-1]
         tgt = lab[:, 1:]
         m = tgt >= 0
-        if m.sum():
+        answer_mask = answer_token_mask(tk, qa, lab)[:, 1:] & m
+        if answer_mask.any():
             lp = F.log_softmax(lg, -1).gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            out.extend(lp[m].tolist())
-    return torch.tensor(out), used
+            out.extend(lp[answer_mask].tolist())
+    return torch.tensor(out), code_freq
 
 
 def hid_slice(off, clen, uid=None):
@@ -605,7 +653,7 @@ def diagnose(model, tk, ev_ex, max_n=40):
     rep = {}
 
     # ---- 1. 基准 ----
-    real, used = _logp_of(model, tk, ex)
+    real, code_freq = _logp_of(model, tk, ex)
     L = len(real)
     rep["n_answer_tokens"] = L
 
@@ -640,7 +688,10 @@ def diagnose(model, tk, ev_ex, max_n=40):
     rep["rna_vs_question"] = rep["d_swap_rna"] / max(rep["d_swap_q"], 1e-9)
 
     # ---- 5. 码本健康度（塌缩检测，在评测集上统计）----
-    cnt = torch.bincount(torch.tensor(sorted(used)), minlength=VOCAB).float()
+    ids = torch.tensor(sorted(code_freq), dtype=torch.long)
+    vals = torch.tensor([code_freq[int(i)] for i in ids], dtype=torch.float32)
+    cnt = torch.zeros(VOCAB, dtype=torch.float32)
+    cnt.index_add_(0, ids, vals)
     p = cnt / cnt.sum().clamp(min=1)
     rep["codes_used"] = int((cnt > 0).sum())
     rep["code_entropy"] = float(-(p * (p + 1e-9).log()).sum())
@@ -648,7 +699,7 @@ def diagnose(model, tk, ev_ex, max_n=40):
     rep["top_code_share"] = float(p.max())
 
     # ---- 6. 码表健康度（行间余弦 + 有效秩）----
-    u = torch.tensor(sorted(used), device=model.rna_emb.weight.device)
+    u = ids.to(model.rna_emb.weight.device)
     w = model.rna_emb.weight[u].float()
     rep["table_row_norm"] = float(w.norm(dim=1).mean())
     if len(u) > 1:
@@ -710,6 +761,48 @@ def adapter_state_dict(model) -> dict:
     return {k: v.detach().cpu() for k, v in llm.state_dict().items() if k in tw}
 
 
+def load_adapter_state(model, state: dict, label: str) -> None:
+    """Load exactly the trainable adapter keys, refusing partial matches."""
+    want = {n for n, p in model.llm.named_parameters() if p.requires_grad}
+    got = set(state or {})
+    model_keys = set(model.llm.state_dict())
+    missing = want - got
+    unexpected = got - model_keys
+    if not got or missing or unexpected:
+        raise RuntimeError(
+            f"{label} 适配器不匹配：checkpoint={len(got)} 张量，"
+            f"缺失 {len(missing)}（{sorted(missing)[:3]}），"
+            f"多余 {len(unexpected)}（{sorted(unexpected)[:3]}）。"
+            "拒绝静默从随机初始化续训。"
+        )
+    res = model.llm.load_state_dict(state, strict=False)
+    if res.unexpected_keys:
+        raise RuntimeError(
+            f"{label} 适配器仍有 unexpected keys: {res.unexpected_keys[:3]}"
+        )
+
+
+def checkpoint_arg_mismatches(old: dict, current) -> list[str]:
+    keys = ("base", "qwen36_mode", "adapter", "lora_r", "lora_preset",
+            "sos_k", "sos_gamma_max", "pool", "rna_emb",
+            "answer_only_loss", "seed")
+    bad = []
+    for key in keys:
+        if key not in old:
+            continue
+        a, b = old[key], getattr(current, key, None)
+        if isinstance(a, float) or isinstance(b, float):
+            same = a is not None and b is not None and abs(float(a) - float(b)) < 1e-12
+        else:
+            same = str(a) == str(b)
+        if not same:
+            bad.append(f"{key}: checkpoint={a!r} current={b!r}")
+    if bool(old.get("codes")) != bool(getattr(current, "codes", "")):
+        bad.append(f"codes: checkpoint={bool(old.get('codes'))!r} "
+                   f"current={bool(getattr(current, 'codes', ''))!r}")
+    return bad
+
+
 def save_ckpt(path: Path, step: int, model, opt, log, args, t_elapsed: float):
     """完整状态。只存适配器参数（底座冻结，存了也没用而且几十 GB）。
 
@@ -726,6 +819,8 @@ def save_ckpt(path: Path, step: int, model, opt, log, args, t_elapsed: float):
     中途被杀只留一个 .tmp，prune_ckpts 下次会清掉。
     """
     lora = adapter_state_dict(model)
+    if not lora:
+        raise RuntimeError(f"{path.name}: 适配器参数为空，拒绝写出不可续训的 checkpoint")
     payload = dict(
         step=step,
         fsq=model.fsq.state_dict(),
@@ -750,19 +845,46 @@ def save_ckpt(path: Path, step: int, model, opt, log, args, t_elapsed: float):
     if n_entry == 0:
         raise RuntimeError(f"{tmp.name} 写出来是空 zip，拒绝顶替 {path.name}")
     os.replace(tmp, path)
-    if not lora:
-        print(f"  ** [ckpt] {path.name} 里适配器参数是空的 —— 检查 adapter_state_dict **",
-              flush=True)
 
 
-def load_ckpt(path: Path, model, opt):
+def load_ckpt(path: Path, model, opt, args, allow_opt_reset: bool = False):
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    model.fsq.load_state_dict(ck["fsq"])                    # 形状必然一致（同一个配置）
-    if model.rna_emb is not None and ck["rna_emb"] is not None:
+    old_args = ck.get("args") or {}
+    bad = checkpoint_arg_mismatches(old_args, args)
+    if bad:
+        raise RuntimeError(f"{path.name} 与当前训练配置不兼容：\n  " + "\n  ".join(bad))
+    old_fp = old_args.get("fingerprint") or {}
+    new_fp = getattr(args, "fingerprint", {}) or {}
+    fp_bad = [f"{k}: checkpoint={old_fp.get(k)} current={new_fp.get(k)}"
+              for k in ("dataset_sha256", "codes_sha256", "fsq_sha256", "hid_sha256")
+              if old_fp.get(k) and new_fp.get(k) and old_fp[k] != new_fp[k]]
+    if fp_bad:
+        raise RuntimeError(f"{path.name} 的数据/码缓存/FSQ 指纹不一致：\n  "
+                           + "\n  ".join(fp_bad))
+    if getattr(args, "codes", ""):
+        cur_fsq = model.fsq.state_dict()
+        ck_fsq = ck["fsq"]
+        fsq_bad = [k for k in cur_fsq
+                   if k not in ck_fsq or cur_fsq[k].shape != ck_fsq[k].shape
+                   or not torch.allclose(cur_fsq[k].cpu(), ck_fsq[k].cpu())]
+        if fsq_bad:
+            raise RuntimeError(
+                f"{path.name} 的 FSQ 与 --fsq 不是同一套：{fsq_bad[:3]}。"
+                "预计算码路径拒绝覆盖当前冻结 FSQ。"
+            )
+    else:
+        model.fsq.load_state_dict(ck["fsq"])
+    if model.rna_emb is not None:
+        if ck["rna_emb"] is None:
+            raise RuntimeError(f"{path.name} 缺少 rna_emb，拒绝只恢复半套状态")
+        if tuple(ck["rna_emb"].shape) != tuple(model.rna_emb.weight.shape):
+            raise RuntimeError(
+                f"{path.name} rna_emb 形状 {tuple(ck['rna_emb'].shape)} != "
+                f"当前 {tuple(model.rna_emb.weight.shape)}")
         model.rna_emb.weight.data.copy_(
             ck["rna_emb"].to(device=model.rna_emb.weight.device,
                              dtype=model.rna_emb.weight.dtype))
-    miss = model.llm.load_state_dict(ck["lora"], strict=False)
+    load_adapter_state(model, ck["lora"], path.name)
     torch.set_rng_state(ck["rng"])
     if ck.get("rng_cuda") and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(ck["rng_cuda"])
@@ -770,9 +892,14 @@ def load_ckpt(path: Path, model, opt):
         opt.load_state_dict(ck["opt"])
         opt_ok = True
     except Exception as e:
+        if not allow_opt_reset:
+            raise RuntimeError(
+                f"{path.name} 优化器状态载入失败（{type(e).__name__}: {e}）。"
+                "默认拒绝静默重置；确认要重置时显式加 --allow-opt-reset 1。"
+            ) from e
         opt_ok = False
-        print(f"  [resume] 优化器状态载入失败（{type(e).__name__}），从零开始优化器")
-    return ck["step"], ck.get("log", []), ck.get("t_elapsed", 0.0), opt_ok, miss
+        print(f"  [resume] 优化器状态载入失败（{type(e).__name__}），按参数要求从零开始")
+    return ck["step"], ck.get("log", []), ck.get("t_elapsed", 0.0), opt_ok
 
 
 def prune_ckpts(d: Path, keep: int) -> int:
@@ -915,6 +1042,8 @@ def main() -> int:
                          "--save-every 300 等于 92 分钟才存一次 —— 崩一次最多丢 1.5 小时。"
                          "按时间兜底后，丢失窗口与步速无关，有硬上限")
     ap.add_argument("--resume", default="", help="从 checkpoint 续训（目录或 .pt 文件）")
+    ap.add_argument("--allow-opt-reset", type=int, default=0,
+                    help="1 = checkpoint 优化器状态不兼容时允许从零恢复（默认拒绝）")
     ap.add_argument("--warm-lora", default="",
                     help="只加载旧 checkpoint 的 LoRA 权重（不动 FSQ / rna_emb / 优化器）。"
                          "用于换码表后的热启动：让「读码」的行为继承下来，只重学码表映射。")
@@ -938,6 +1067,8 @@ def main() -> int:
                     help="--codes 对应的 uid/offset/length 索引。")
     ap.add_argument("--diag", type=int, default=1, help="每个 eval 点跑诊断套件")
     ap.add_argument("--diag-n", type=int, default=40, help="诊断用多少条样本")
+    ap.add_argument("--seed", type=int, default=20261101,
+                    help="不放回 bucket sampler 的确定性种子")
     # ---- 换底座 ----
     ap.add_argument("--base", choices=["qwen3-8b", "qwen36-35b"], default="qwen3-8b")
     ap.add_argument("--qwen36-mode", choices=["int4", "int8"], default="int4",
@@ -990,16 +1121,33 @@ def main() -> int:
         global FSQ_CKPT
         FSQ_CKPT = Path(args.fsq)
         print(f"[cfg] FSQ 检查点改为 {FSQ_CKPT}")
+    if (args.fsq or args.codes) and not FSQ_CKPT.is_file():
+        raise SystemExit(f"FSQ 检查点不存在：{FSQ_CKPT}")
+    fsq_meta = None
+    if FSQ_CKPT.is_file():
+        fsq_meta = torch.load(FSQ_CKPT, map_location="cpu", weights_only=False)
+        LATENT = int(fsq_meta["latent"])
+        LEVELS = int(fsq_meta["levels"])
+        VOCAB = LEVELS ** LATENT
+        print(f"[cfg] 从 {FSQ_CKPT.name} 读：LATENT={LATENT} LEVELS={LEVELS} VOCAB={VOCAB}")
+    args.fingerprint = {"fsq_sha256": sha256_file(FSQ_CKPT)} if FSQ_CKPT.is_file() else {}
+    if args.data:
+        data_path = Path(args.data)
+        if not data_path.is_file():
+            raise SystemExit(f"数据文件不存在：{data_path}")
+        args.fingerprint["dataset_sha256"] = sha256_file(data_path)
     if args.smoke:
         args.rna, args.eval_rna, args.steps = 200, 40, 40
         args.eval_every = 20; args.eval_n = 8
 
     tag = args.tag or ("smoke" if args.smoke else f"{args.rna}_s{args.steps}_{args.rna_emb}")
-    outdir = ROOT / "runs" / f"e2e_{tag}"
+    outdir = RUNS_DIR / f"e2e_{tag}"
     outdir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    print(f"[out] {outdir}\n[rna-emb] {args.rna_emb}  ent {args.ent_coef}  "
-          f"commit {args.commit_coef}  ortho {args.ortho_coef}")
+    frozen = "disabled (frozen FSQ)" if args.codes else args.ent_coef
+    commit = "disabled (frozen FSQ)" if args.codes else args.commit_coef
+    print(f"[out] {outdir}\n[rna-emb] {args.rna_emb}  ent {frozen}  "
+          f"commit {commit}  ortho {args.ortho_coef}")
 
     global HID_TENSOR, CODES, CODE_IDX
     hid, lens, offsets = None, [], []
@@ -1010,13 +1158,38 @@ def main() -> int:
         import numpy as np
         print(f"[codes] 1/3 torch.load 索引 {args.codes_idx}", flush=True)
         dc = torch.load(args.codes_idx, map_location="cpu", weights_only=False)
+        n_pos = int(dc["n_pos"])
+        code_bytes = Path(args.codes).stat().st_size
+        checks = {
+            "n_pos": n_pos == int(dc["lens"].sum()),
+            "bytes": code_bytes == n_pos * 2,
+            "uids": len(dc["uids"]) == len(dc["offsets"]) == len(dc["lens"]),
+            "vocab": int(dc["vocab"]) == VOCAB,
+            "latent": int(dc["latent"]) == LATENT,
+            "levels": int(dc["levels"]) == LEVELS,
+            "pool": int(dc["pool"]) == args.pool,
+            "dataset": dc.get("dataset_sha256") == args.fingerprint.get("dataset_sha256"),
+            "fsq": dc.get("fsq_sha256") == args.fingerprint.get("fsq_sha256"),
+            "offset_start": int(dc["offsets"][0]) == 0,
+            "offset_end": int(dc["offsets"][-1] + dc["lens"][-1]) == n_pos,
+            "contiguous": bool(torch.equal(
+                dc["offsets"][1:], dc["offsets"][:-1] + dc["lens"][:-1])),
+        }
+        if not all(checks.values()):
+            raise RuntimeError(f"码缓存校验失败：{checks}")
+        args.fingerprint["codes_sha256"] = sha256_file(Path(args.codes))
+        args.fingerprint["codes_index_sha256"] = sha256_file(Path(args.codes_idx))
         mmc = np.memmap(args.codes, dtype=np.uint16, mode="r",
-                        shape=(int(dc["n_pos"]),))
+                        shape=(n_pos,))
         CODES = torch.from_numpy(mmc).clone()
+        if int(CODES.max()) >= VOCAB:
+            raise RuntimeError(f"码缓存最大 ID {int(CODES.max())} >= VOCAB {VOCAB}")
         CODE_IDX = {
             uid: ("codes", int(dc["offsets"][i]), int(dc["lens"][i]))
             for i, uid in enumerate(dc["uids"])
         }
+        if len(CODE_IDX) != len(dc["uids"]):
+            raise RuntimeError("码缓存 uid 有重复，无法建立唯一索引")
         print(f"[codes] 2/3 memmap ok  {tuple(mmc.shape)}  vocab={dc['vocab']}", flush=True)
         print(f"[codes] 3/3 uid={len(CODE_IDX):,}  来自 {Path(args.codes).name}", flush=True)
         print("[codes] FSQ encoder 冻结；训练 LLM adapter + code embedding", flush=True)
@@ -1087,12 +1260,14 @@ def main() -> int:
                     miss += 1
                     continue
                 sp = q.get("split", "train")
+                if sp not in buckets:
+                    raise RuntimeError(f"未知 split={sp!r}（uid={u}）")
                 clen = (source_idx[u][2] if args.codes
                         else source_idx[u][2] // P)
                 item = ({"uid": u, "sequence": q.get("sequence", "")},
                         {"question": q["question"], "answer": q["answer"]},
                         clen, source_idx[u][1])
-                buckets.get(sp, tr).append(item)
+                buckets[sp].append(item)
         if miss:
             kind = "码缓存" if args.codes else "隐藏态缓存"
             print(f"[warn] {miss:,} 条 QA 的 uid 不在{kind}里")
@@ -1122,13 +1297,6 @@ def main() -> int:
           f"最终 {len(te_ex or ev_ex):,} QA")
     assert tr_ex and ev_ex
 
-    # 从 tokenizer 检查点读 LATENT/LEVELS/VOCAB —— 单一真相来源
-    if FSQ_CKPT.exists():
-        _ck = torch.load(FSQ_CKPT, map_location="cpu", weights_only=False)
-        LATENT, LEVELS = int(_ck["latent"]), int(_ck["levels"])
-        VOCAB = LEVELS ** LATENT
-        print(f"[cfg] 从 {FSQ_CKPT.name} 读：LATENT={LATENT} LEVELS={LEVELS} VOCAB={VOCAB}")
-
     from transformers import AutoTokenizer
     # **tokenizer 必须跟着底座走。**
     # 写死 QWEN 的话，跑 35B 时会拿 8B 的 tokenizer：
@@ -1142,7 +1310,8 @@ def main() -> int:
           f"im_start {tk.im_start[-4:]}  pad {tk.pad_id}  "
           f"no_think {len(tk.no_think)} token")
     print("\n=== 建模型 ===")
-    model = E2EModel(args.lora_r, args.rna_emb, pool=args.pool,
+    model = E2EModel(args.lora_r, args.rna_emb, latent=LATENT, levels=LEVELS,
+                     pool=args.pool,
                      base=args.base, base_mode=args.qwen36_mode,
                      lora_preset=args.lora_preset, base_bits=args.base_bits,
                      adapter=args.adapter, sos_k=args.sos_k,
@@ -1220,7 +1389,10 @@ def main() -> int:
           f"p90 {_s[int(len(_s) * 0.9)]}  p99 {_s[int(len(_s) * 0.99)]}  "
           f"max {_s[-1]}   旧口径码长 {min(_c)}~{max(_c)}")
     if args.init_code_emb and model.rna_emb is not None:
-        ci = torch.load(args.init_code_emb, map_location='cpu', weights_only=False)
+        init_path = Path(args.init_code_emb)
+        if not init_path.is_file():
+            raise RuntimeError(f"--init-code-emb 不存在：{init_path}")
+        ci = torch.load(init_path, map_location='cpu', weights_only=False)
         w = ci['code_emb'].to(device=model.rna_emb.weight.device,
                              dtype=model.rna_emb.weight.dtype)
         if w.shape != model.rna_emb.weight.shape:
@@ -1230,9 +1402,12 @@ def main() -> int:
                 f"说明 LATENT/LEVELS({LATENT}/{LEVELS}) 与那个文件不是同一版。"
                 f"先用同一个 tokenizer 检查点重跑 51_。")
         model.rna_emb.weight.data.copy_(w)
+        args.fingerprint["init_code_emb_sha256"] = sha256_file(init_path)
         print('[init] 码表按内容初始化（同 6-mer 余弦 +0.313 vs 随机 +0.017）')
-    if FSQ_CKPT.exists() and not args.smoke:
-        ck = torch.load(FSQ_CKPT, map_location="cpu", weights_only=False)
+    if FSQ_CKPT.is_file():
+        ck = fsq_meta
+        if ck is None:
+            ck = torch.load(FSQ_CKPT, map_location="cpu", weights_only=False)
         # 只加载形状匹配的权重。码表尺寸变了（4096->256）时 enc 是 (8,768)、检查点是 (12,768)，
         # **strict=False 也挡不住 shape mismatch**，会直接 RuntimeError。
         cur = model.fsq.state_dict()
@@ -1247,8 +1422,7 @@ def main() -> int:
             raise RuntimeError(
                 f"FSQ 检查点 {FSQ_CKPT.name} 与当前配置形状全不匹配（跳过 {skipped}）。"
                 f"当前 LATENT={LATENT} LEVELS={LEVELS}，检查点 latent="
-                f"{ck['state']['enc.weight'].shape[0]}。请重跑 48_ 重新生成，"
-                f"或用 --no-fsq-init 显式声明要随机初始化。")
+                f"{ck['state']['enc.weight'].shape[0]}。请用配套 FSQ 重新生成。")
         print(f"[init] FSQ.enc 载入 {len(sd)} 个张量"
               + (f"，跳过形状不符的 {skipped}" if skipped else ""))
     if args.codes:
@@ -1277,7 +1451,7 @@ def main() -> int:
 
     ckdir = outdir / "ckpt"
     ckdir.mkdir(parents=True, exist_ok=True)
-    start_step, log, t_prev, opt_ok, _ = 1, [], 0.0, True, None
+    start_step, log, t_prev, opt_ok = 1, [], 0.0, True
     if args.resume:
         rp = Path(args.resume)
         if rp.is_dir():
@@ -1285,7 +1459,8 @@ def main() -> int:
             if not cands:
                 raise SystemExit(f"{rp} 下没有 step_*.pt")
             rp = cands[-1]
-        start_step, log, t_prev, opt_ok, _ = load_ckpt(rp, model, opt)
+        start_step, log, t_prev, opt_ok = load_ckpt(
+            rp, model, opt, args, allow_opt_reset=bool(args.allow_opt_reset))
         start_step += 1
         print(f"[resume] 从 {rp.name} 续训，step {start_step}，"
               f"优化器 {'已恢复' if opt_ok else '未恢复'}，历史 {len(log)} 条记录")
@@ -1298,10 +1473,16 @@ def main() -> int:
                 raise SystemExit(f"{wp} 下没有 step_*.pt")
             wp = cands[-1]
         wk = torch.load(wp, map_location="cpu", weights_only=False)
-        miss = model.llm.load_state_dict(wk["lora"], strict=False)
-        print(f"[warm] 只载 LoRA：{wp.name}  missing={len(miss.missing_keys)} "
-              f"unexpected={len(miss.unexpected_keys)}")
+        load_adapter_state(model, wk["lora"], f"warm {wp.name}")
+        print(f"[warm] 只载 LoRA：{wp.name}  {len(wk['lora'])} 个张量，全部匹配")
         print(f"[warm] FSQ 与 rna_emb 保持前面载入的新码表，优化器从零开始")
+
+    batch_stream = sample_batches(
+        buckets, elen, args.batch, args.token_budget, args.seed)
+    for _ in range(start_step - 1):
+        next(batch_stream)
+    print(f"[sample] 不放回 bucket sampler  seed={args.seed}  "
+          f"batch<={args.batch}  token-budget={args.token_budget}")
 
     # ---- 早停状态 ----
     best_ce = float("inf")
@@ -1311,15 +1492,20 @@ def main() -> int:
     stop_reason = ""
     stopped_early = False
     ce_hist: list[dict] = []
-    if args.early_stop:
+    ran_steps = start_step <= args.steps
+    if args.early_stop and ran_steps:
         # 续训时从 log 里恢复最优值和耐心计数，否则 patience 会被重置
         for rec in log:
             e = rec.get("early")
-            if e:
+            if e and e.get("metric") == EARLY_METRIC:
                 if e.get("ce_a", float("inf")) < best_ce:
                     best_ce, best_step, best_gap = e["ce_a"], rec["step"], e["gap"]
                 if "patience_left" in e:
                     patience_left = e["patience_left"]
+        if best_step > 0 and not (ckdir / "best.pt").is_file():
+            print("[早停] 历史记录有 best 但 best.pt 不存在；本轮重新建立 best")
+            best_ce, best_step, best_gap = float("inf"), -1, float("nan")
+            patience_left = args.patience
         if best_step > 0:
             print(f"[早停] 从历史恢复：最优 CE_A {best_ce:.4f} @ step {best_step}  "
                   f"耐心剩 {patience_left}")
@@ -1334,23 +1520,10 @@ def main() -> int:
     model.train()
     t_last_save = time.time()
     _ver = {"d": [], "jit": []}      # 手工 loss 与 HF 的逐点差，累积后按中位数判（见下）
+    last_step = start_step - 1
     for step in range(start_step, args.steps + 1):
-        bk = buckets[torch.randint(0, len(buckets), (1,)).item()]
-        # tot 累计真实步长，mx 是这一步的 T，两条都要卡：
-        #   sum(eff) <= budget    管总计算量
-        #   T*(B+1) <= budget     直接管 B*T —— 单靠 sum 不够：桶是按码长分的，
-        #                         同桶内文本长度仍可能差好几倍，T 会被最长那条顶上去
-        ex, tot, mx = [], 0, 0
-        while len(ex) < args.batch:
-            i = bk[torch.randint(0, len(bk), (1,)).item()]
-            eff = elen[i]
-            nmx = eff if eff > mx else mx
-            if ex and (tot + eff > args.token_budget
-                       or nmx * (len(ex) + 1) > args.token_budget):
-                break
-            ex.append(tr_ex[i]); tot += eff; mx = nmx
-        if not ex:
-            ex = [tr_ex[bk[0]]]
+        last_step = step
+        ex = [tr_ex[i] for i in next(batch_stream)]
         ids, lab, am = build_batch(tk, ex)
         model.reset_usage()          # 不清空的话，fsq_usage 会跨步累积
         vecs, codes_all, t_all, q_all = [], [], [], []
@@ -1518,7 +1691,6 @@ def main() -> int:
                 do_ab = (step % args.ablation_every == 0)
             ab = (run_ablation(model, tk, ev_ex, hid, max_n=args.eval_n)
                   if do_ab else None)
-            model.train()
             if ab is not None:
                 print(f"  [eval@{step}] 全部标签 n={ab['zero']['n']}  " + "  ".join(
                     f"vs{k} {100*v['frac_neg']:.1f}%(m{v['mean']:+.3f})"
@@ -1543,68 +1715,68 @@ def main() -> int:
 
             # ---- 早停：只算 CE，不生成 ----
             if args.early_stop:
-                # **必须 eval 模式。** 上一行刚 model.train() 过，
-                # 直接算 CE 会带着 dropout 跑，监视量就不是确定的量了。
-                model.eval()
                 ce_a, se_a = val_ce(model, tk, ev_ex, arm="A", max_n=args.eval_n)
                 ce_c, _ = val_ce(model, tk, ev_ex, arm="C", max_n=args.eval_n)
-                model.train()
                 gap = ce_c - ce_a
-                ce_hist.append(dict(step=step, ce_a=ce_a, se_a=se_a, ce_c=ce_c,
-                                    gap=gap, best=best_ce))
-                # 落进 log 才能随 checkpoint 持久化（续训时要恢复最优值和耐心计数）
-                log.append(dict(step=step, early=dict(
-                    ce_a=ce_a, se_a=se_a, ce_c=ce_c, gap=gap, best=best_ce,
-                    patience_left=patience_left)))
                 # 判据的**有效阈值**：既要超过相对改善 min_delta，
                 # 也要超过一个标准误。少了 se 这一项，patience 会被噪声吃光。
                 if best_ce == float("inf"):
                     need = 0.0
                 else:
                     need = max(args.min_delta * abs(best_ce), se_a)
+                improved = best_ce == float("inf") or ce_a < best_ce - need
+                if improved:
+                    best_ce, best_step, best_gap = ce_a, step, gap
+                    patience_left = args.patience
+                elif step >= args.min_steps:
+                    patience_left -= 1
+
+                ce_hist.append(dict(step=step, ce_a=ce_a, se_a=se_a, ce_c=ce_c,
+                                    gap=gap, best=best_ce))
+                # 先更新 state 再落 log；best.pt 里的 log 才会恢复正确 patience。
+                log.append(dict(step=step, early=dict(
+                    metric=EARLY_METRIC,
+                    ce_a=ce_a, se_a=se_a, ce_c=ce_c, gap=gap, best=best_ce,
+                    patience_left=patience_left)))
+                if improved:
+                    bp = ckdir / "best.pt"
+                    save_ckpt(bp, step, model, opt, log, args, time.time() - t0)
                 print(f"  [早停@{step}] CE_A {ce_a:.4f}±{se_a:.4f}  CE_C {ce_c:.4f}  "
                       f"gap {gap:+.4f}   最优 {best_ce:.4f}@{best_step}  "
                       f"需改善 {need:.4f}  耐心 {patience_left}/{args.patience}",
                       flush=True)
+                if improved:
+                    print(f"           ↑ 新的最优，已存 {(ckdir / 'best.pt').name}",
+                          flush=True)
+                if step >= args.min_steps and patience_left <= 0:
+                    stopped_early = True
+                    stop_reason = (f"CE_A 连续 {args.patience} 个 eval 点"
+                                   f"（{args.patience*args.eval_every:,} 步）"
+                                   f"改善 < max({args.min_delta:.1%}×CE, 1 se)"
+                                   f"={need:.4f}")
+                    print(f"  ** 早停触发：{stop_reason}  "
+                          f"最优 {best_ce:.4f}@{best_step}（gap {best_gap:+.4f}）**",
+                          flush=True)
+                    break
+            model.train()
 
-                if step >= args.min_steps:
-                    if best_ce == float("inf"):
-                        best_ce, best_step, best_gap = ce_a, step, gap
-                    elif ce_a < best_ce - need:
-                        best_ce, best_step, best_gap = ce_a, step, gap
-                        patience_left = args.patience
-                        bp = ckdir / "best.pt"
-                        save_ckpt(bp, step, model, opt, log, args, time.time() - t0)
-                        print(f"           ↑ 新的最优，存 {bp.name}", flush=True)
-                    else:
-                        patience_left -= 1
-                        if patience_left <= 0:
-                            stopped_early = True
-                            stop_reason = (f"CE_A 连续 {args.patience} 个 eval 点"
-                                           f"（{args.patience*args.eval_every:,} 步）"
-                                           f"改善 < max({args.min_delta:.1%}×CE, 1 se)"
-                                           f"={need:.4f}")
-                            print(f"  ** 早停触发：{stop_reason}  "
-                                  f"最优 {best_ce:.4f}@{best_step}（gap {best_gap:+.4f}）**",
-                                  flush=True)
-                            # **必须真的跳出训练循环。**
-                            # 少了这句，早停只会打印一行然后继续跑满 args.steps ——
-                            # 表面上"早停生效"，实际一步没省，而且最后还会把
-                            # 训过头的权重载回 best，看起来完全正常。静默失效。
-                            break
-                else:
-                    # min_steps 之前仍然记录 best，但不开始计耐心
-                    if ce_a < best_ce:
-                        best_ce, best_step, best_gap = ce_a, step, gap
+    if args.early_stop:
+        bp = ckdir / "best.pt"
+        if best_step <= 0 or not bp.is_file():
+            raise RuntimeError(
+                "早停已开启，但 best.pt/最优步不存在；拒绝把最后一 step 冒充 best")
+        if best_step < last_step:
+            print(f"\n[早停] 载回 best.pt（step {best_step}，CE_A {best_ce:.4f}）")
+            loaded_step, best_log, _, _ = load_ckpt(
+                bp, model, opt, args, allow_opt_reset=False)
+            if loaded_step != best_step:
+                raise RuntimeError(f"best.pt step={loaded_step} 与记录 best_step={best_step} 不一致")
+            log = best_log
+            ce_hist = [r["early"] | {"step": r["step"]}
+                       for r in log if r.get("early")]
 
-    if stopped_early and (ckdir / "best.pt").exists():
-        print(f"\n[早停] 载回 best.pt（step {best_step}，CE_A {best_ce:.4f}）")
-        load_ckpt(ckdir / "best.pt", model, opt)
-
-    # final.pt 的 step 用**权重实际对应的步数**。
-    # 早停时载回的是 best.pt，所以应该记 best_step；记 args.steps 或停下的步数
-    # 都会让续训脚本从错误的位置接。
-    end_step = best_step if (stopped_early and best_step > 0) else args.steps
+    # final.pt 的 step 必须与内存中的权重一致。
+    end_step = best_step if (args.early_stop and ran_steps) else last_step
     fp = ckdir / "final.pt"
     save_ckpt(fp, end_step, model, opt, log, args, time.time() - t0)
     print(f"[ckpt] final.pt  (step {end_step}, "
@@ -1650,15 +1822,17 @@ def main() -> int:
               f"但置换 {100*pk:.1f}% 说明把码打乱不影响结果。")
         print("     => 码的切分方式对 LLM 无意义，要改的是 tokenizer 的目标，不是加步数。")
     else:
+        hint = "--codes 路径看码表漂移/梯度" if args.codes else "看 |grad_fsq|"
         print(f"  ❌ 连「有东西」都不起作用（答案 token 上零表 {100*zk:.1f}%）。"
-              f"先查梯度是否回传（看 |grad_fsq|）。")
+              f"先查梯度是否回传（{hint}）。")
     print()
     print("  注意：Δlogp 的**均值**是另一个独立证据，它不被稀释。若均值上")
     print("       零表 < 置换 ≈ 常数码，说明「错误但看似合理的码」比「没有码」更有害")
     print("       —— 那是码身份在起作用的强证据（存在感假设会给出相反的排序）。")
 
     (outdir / "summary.json").write_text(json.dumps(
-        dict(args=vars(args), log=log, final=ab), ensure_ascii=False, indent=2), encoding="utf-8")
+        dict(args=vars(args), end_step=end_step, log=log, final=ab),
+        ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 交付产物：adapter / FSQ / 码表 分开存，推理时都要用
     sd = Path(args.save_dir) if args.save_dir else (outdir / "artifacts")
@@ -1679,11 +1853,31 @@ def main() -> int:
                sd / "fsq.pt")
     if model.rna_emb is not None:
         torch.save(model.rna_emb.weight.detach().cpu(), sd / "code_emb.pt")
-    (sd / "meta.json").write_text(json.dumps(
-        dict(rna_emb_mode=args.rna_emb, base_vocab=model.base_vocab, vocab=VOCAB,
-             latent=LATENT, levels=LEVELS, adapter=args.adapter,
-             sos_k=args.sos_k if args.adapter == "sos" else None,
-             base=args.base, base_bits=args.base_bits), indent=2), encoding="utf-8")
+    meta = dict(
+        rna_emb_mode=args.rna_emb,
+        base_vocab=model.base_vocab,
+        vocab=VOCAB,
+        latent=LATENT,
+        levels=LEVELS,
+        base=args.base,
+        qwen36_mode=args.qwen36_mode if args.base == "qwen36-35b" else None,
+        base_bits=args.base_bits if args.base == "qwen3-8b" else None,
+        adapter=args.adapter,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_r * 2,
+        lora_preset=args.lora_preset if args.base == "qwen36-35b" else None,
+        sos_k=args.sos_k if args.adapter == "sos" else None,
+        sos_gamma_max=args.sos_gamma_max if args.adapter == "sos" else None,
+        sos_dropout=args.sos_dropout if args.adapter == "sos" else None,
+        pool=args.pool,
+        seed=args.seed,
+        step=end_step,
+        fingerprint=getattr(args, "fingerprint", {}),
+        note=("SOS merge scales need lora_r, sos_k, sos_gamma_max; "
+              "the base model is not embedded in this artifact directory."),
+    )
+    (sd / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[ship] {sd}  adapter({'sos' if args.adapter=='sos' else 'lora'}) "
           f"+ fsq.pt + code_emb.pt + meta.json")
     print(f"\n[save] {outdir/'summary.json'}   用时 {(time.time()-t0)/60:.1f} min")

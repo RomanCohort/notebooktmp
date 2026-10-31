@@ -25,8 +25,8 @@ The notebook:
 
 1. clones this repository;
 2. downloads ERNIE-RNA and Qwen3.6-35B-A3B;
-3. mean-pools 4 hidden positions and streams them through the trained FSQ into a
-   compact uint16 code cache (about 25 MiB);
+3. downloads the published 25 MiB uint16 code cache (or regenerates it from the
+   final dataset and FSQ tokenizer as a fallback);
 4. runs a 10-step smoke test;
 5. runs resumable full training.
 
@@ -38,10 +38,10 @@ memory, and the int4 base only takes 18.2 GiB.
 
 | setting | value | why |
 |---|---|---|
-| `--token-budget` | `2048` | ~18 samples/step instead of ~4 |
+| `--token-budget` | `2048` | caps padded `B*T`; the actual sample count varies |
 | `--batch` | `16` | hard cap on samples per step |
 | `--grad-ckpt` | `1` | activations ~12 GiB instead of ~40 GiB at B*T=2048 |
-| `--steps` | `46500` | one epoch of `rnaqa_v3_l234.jsonl` (95.2M / 2048) |
+| `--steps` | `46500` | fixed compute budget, not one epoch |
 | `--min-steps` | `20000` | keeps early stopping from firing at 4k steps |
 | `--ablation-every` | `500` | vsperm/vszero/vsrandom/vsconst at every eval point |
 
@@ -55,9 +55,11 @@ If `--token-budget 2048` still OOMs, drop to `1536` first; only fall back to
 `1024` if that fails too.
 
 The full-run cell wraps the trainer in `timeout --signal=TERM`, so a 46500-step
-epoch is expected to span more than one Colab segment. Training resumes from the
+run is expected to span more than one Colab segment. Training resumes from the
 newest checkpoint each time; the step counter is restored, so `--min-steps`
-accumulates across segments.
+accumulates across segments. The dataset has 1,060,818 QA rows total
+(831,390 train / 66,796 val / 162,632 test), so 46,500 steps must not be
+described as one epoch. Sampling is without replacement inside each epoch.
 
 Checkpoint sync is optional. To persist training across Colab runtimes, create a
 fine-grained GitHub token with Contents read/write permission and add it to
@@ -66,12 +68,18 @@ release tagged `train-v3-checkpoints`.
 
 Checkpoints are saved every 100 steps or every 10 minutes, whichever comes
 first. The local runtime keeps the newest three snapshots. The background GitHub
-sync uploads the newest complete snapshot before deleting the previous release
-asset.
+sync validates and uploads the newest complete snapshot. On completion it also
+uploads `final.pt`, `best.pt`, and a zipped `artifacts/` directory.
 
-The code cache is runtime-local. A fresh Colab runtime regenerates it from the
-dataset and trained FSQ tokenizer before resuming. The FSQ encoder is frozen in
-this low-disk mode; the LLM adapter and code embedding table remain trainable.
+Data, code, checkpoints, and artifacts live under `/content/rnaqwen_assets`, so
+refreshing the GitHub code checkout does not delete them. They are still
+runtime-local without a mounted persistent store or GitHub checkpoint sync. The
+FSQ encoder is frozen in this low-disk mode; the LLM adapter and code embedding
+table remain trainable.
+
+GGUF quantization is a separate post-training step. It requires the original
+35B base model plus a machine with enough disk for an intermediate merged model
+and the final GGUF; it is not run inside the training cell.
 
 ## Released assets
 

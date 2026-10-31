@@ -155,7 +155,9 @@ checkpoint.
 ## 7. GGUF export is separate
 
 Do not run GGUF export by default on the training filesystem. Q8_0 plus Q4_K_M
-adds about 55 GiB. Use a machine with at least 170 GiB free and run:
+adds about 55 GiB. Use the full local RNAQwen workspace (which contains
+`scripts/97_export_preview.py` and `scripts/98_export_gguf.py`) on a machine
+with at least 170 GiB free:
 
 ```bash
 python scripts/98_export_gguf.py --phase patch \
