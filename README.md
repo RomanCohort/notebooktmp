@@ -55,9 +55,10 @@ Qwen3.6 has 30 linear-attention layers. The notebook requires both
 `flash-linear-attention[cuda]` and `causal-conv1d` before importing the model;
 otherwise Transformers falls back to the pure-PyTorch chunk/recurrent
 implementation and each step becomes far slower. FLA is installed from its
-wheel. `causal-conv1d` is installed only from the exact official GitHub release
-wheel matching Python, torch, CUDA, and C++ ABI, and the notebook never falls
-back to a source build. The trainer prints `[profile]` timings for its first
+wheel. `causal-conv1d` is installed only from the exact wheel matching Python,
+torch, CUDA, and C++ ABI; this repository publishes the Colab/A100 build in the
+`kernel-wheels-v1` release. The notebook never falls back to a source build.
+The trainer prints `[profile]` timings for its first
 three steps: batch/data, model+LM loss, auxiliary loss, backward, and optimizer.
 
 If `--token-budget 2048` still OOMs, drop to `1536` first; only fall back to
@@ -100,4 +101,5 @@ and the final GGUF; it is not run inside the training cell.
 
 - Dataset: https://github.com/RomanCohort/notebooktmp/releases/tag/dataset-v3
 - FSQ checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/fsq-stream-v1
+- Python 3.13 / torch 2.11 / CUDA 13 kernel wheel: https://github.com/RomanCohort/notebooktmp/releases/tag/kernel-wheels-v1
 - Checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/train-v3-checkpoints

@@ -1,0 +1,81 @@
+name: validate-colab-stack
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install exact Colab stack
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir \
+            torch==2.11.0 \
+            --index-url https://download.pytorch.org/whl/cu130
+          python -m pip install --no-cache-dir \
+            transformers==5.9.0 \
+            peft==0.21.2 \
+            accelerate==1.15.0 \
+            bitsandbytes==0.50.2 \
+            safetensors==0.8.0 \
+            sentencepiece==0.2.2 \
+            huggingface_hub==1.33.0 \
+            multimolecule==0.2.1 \
+            ninja \
+            "requests>=2.32"
+          python -m pip install --no-cache-dir \
+            "flash-linear-attention[cuda]==0.6.0"
+          python -m pip install --no-deps \
+            "https://github.com/RomanCohort/notebooktmp/releases/download/kernel-wheels-v1/causal_conv1d-1.7.0%2Bcu13torch2.11cxx11abitrue-cp313-cp313-linux_x86_64.whl"
+
+      - name: Verify imports and dependency graph
+        run: |
+          python -m pip check
+          python - <<'PY'
+          import sys
+          import torch
+          import transformers
+          import peft
+          import accelerate
+          import bitsandbytes
+          import safetensors
+          import sentencepiece
+          import huggingface_hub
+          import multimolecule
+          import fla
+          import fla.ops.gated_delta_rule
+          import causal_conv1d
+          import causal_conv1d_cuda
+          import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen
+
+          versions = {
+              "python": sys.version.split()[0],
+              "torch": torch.__version__,
+              "cuda": torch.version.cuda,
+              "transformers": transformers.__version__,
+              "peft": peft.__version__,
+              "accelerate": accelerate.__version__,
+              "bitsandbytes": bitsandbytes.__version__,
+              "huggingface_hub": huggingface_hub.__version__,
+              "fla": fla.__version__,
+              "causal_conv1d": causal_conv1d.__version__,
+          }
+          print(versions)
+          assert sys.version_info[:2] == (3, 13)
+          assert torch.__version__.startswith("2.11.0+cu130")
+          assert torch.version.cuda.startswith("13.0")
+          assert hasattr(fla.ops.gated_delta_rule, "chunk_gated_delta_rule")
+          assert hasattr(qwen, "torch_chunk_gated_delta_rule")
+          assert hasattr(qwen, "torch_recurrent_gated_delta_rule")
+          print("colab stack ok")
+          PY
