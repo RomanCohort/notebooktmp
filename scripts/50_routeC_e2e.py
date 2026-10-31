@@ -1317,10 +1317,10 @@ def main() -> int:
         try:
             mod = importlib.import_module(module)
             if module == "fla":
-                required = ("chunk_gated_delta_rule", "recurrent_gated_delta_rule")
-                missing = [x for x in required if not hasattr(mod, x)]
-                if missing:
-                    raise ImportError(f"fla missing {missing}")
+                ops = importlib.import_module("fla.ops.gated_delta_rule")
+                if not hasattr(ops, "chunk_gated_delta_rule"):
+                    raise ImportError(
+                        "fla.ops.gated_delta_rule.chunk_gated_delta_rule missing")
             fast_path[module] = getattr(mod, "__version__", "installed")
         except Exception as exc:
             fast_path[module] = None

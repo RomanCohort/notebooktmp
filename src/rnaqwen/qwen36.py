@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import json
 import os
 import re
@@ -632,6 +633,12 @@ def load_qwen36_text(mode: str = "int4", smoke: int = -1, min_free: float = 0.0,
     model 是 VLM 类（`Qwen3_5MoeForConditionalGeneration`），它的 forward
     **接受 `inputs_embeds`**，所以 route C 的注入路径可以直接用。
     """
+    # Make fla.ops visible before Transformers evaluates the decorator that
+    # resolves fla.ops.gated_delta_rule.chunk_gated_delta_rule.
+    try:
+        importlib.import_module("fla.ops.gated_delta_rule")
+    except Exception:
+        pass
     import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as M
     from transformers import AutoConfig
 
