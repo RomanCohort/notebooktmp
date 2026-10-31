@@ -25,7 +25,8 @@ The notebook:
 
 1. clones this repository;
 2. downloads ERNIE-RNA and Qwen3.6-35B-A3B;
-3. streams ERNIE hidden states into a compact uint16 code cache (about 100 MiB);
+3. mean-pools 4 hidden positions and streams them through the trained FSQ into a
+   compact uint16 code cache (about 25 MiB);
 4. runs a 10-step smoke test;
 5. runs resumable full training.
 

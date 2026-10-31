@@ -59,7 +59,9 @@ def main() -> int:
     ap.add_argument("--out", default=str(ROOT / "data/processed/_rnaqa_v3_codes.u16"))
     ap.add_argument("--idx", default=str(ROOT / "data/processed/_rnaqa_v3_codes_index.pt"))
     ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--pool", type=int, default=4)
     ap.add_argument("--save-every", type=int, default=256)
+    ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--min-free-gb", type=float, default=2.0)
     args = ap.parse_args()
 
@@ -67,11 +69,15 @@ def main() -> int:
     idx = Path(args.idx)
     state_path = out.with_suffix(out.suffix + ".state.json")
     uids, seqs = read_unique(Path(args.data))
-    lens = [len(s) for s in seqs]
+    if args.limit:
+        uids, seqs = uids[:args.limit], seqs[:args.limit]
+    if args.pool < 1:
+        raise ValueError("--pool must be >= 1")
+    lens = [len(s) // args.pool for s in seqs]
     total = sum(lens)
     need_gb = total * 2 / 2**30
     print(f"[data] {len(seqs):,} sequences / {total:,} positions", flush=True)
-    print(f"[data] uint16 cache {need_gb:.3f} GiB", flush=True)
+    print(f"[data] pool={args.pool}  uint16 cache {need_gb:.3f} GiB", flush=True)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     free_gb = shutil.disk_usage(out.parent).free / 2**30
@@ -127,17 +133,21 @@ def main() -> int:
                         f"Encoder length mismatch for {uids[base+j]}: "
                         f"expected {len(seq)}, got {hh.shape[0]}"
                     )
+                ncode = len(seq) // args.pool
+                pooled = hh[:ncode * args.pool].reshape(
+                    ncode, args.pool, hh.shape[-1]
+                ).mean(1)
                 digits = torch.round(
-                    (torch.tanh(hh @ fsq_w.T + fsq_b) + 1)
+                    (torch.tanh(pooled @ fsq_w.T + fsq_b) + 1)
                     / 2 * (levels - 1)
                 ).long()
-                codes = torch.zeros(digits.shape[0], dtype=torch.long, device=DEV)
+                codes = torch.zeros(ncode, dtype=torch.long, device=DEV)
                 for d in range(latent):
                     codes = codes * levels + digits[:, d]
-                mm[pos:pos + len(seq)] = codes.cpu().numpy().astype(np.uint16)
-                pos += len(seq)
+                mm[pos:pos + ncode] = codes.cpu().numpy().astype(np.uint16)
+                pos += ncode
                 kept_u.append(uids[base + j])
-                kept_l.append(len(seq))
+                kept_l.append(ncode)
             del encoded, hidden, mask
 
             done = min(base + len(chunk), len(seqs))
@@ -167,7 +177,7 @@ def main() -> int:
     )[:-1]
     torch.save(dict(
         lens=lens_t, offsets=offsets, uids=kept_u,
-        n_pos=pos, vocab=vocab, latent=latent, levels=levels,
+        n_pos=pos, vocab=vocab, latent=latent, levels=levels, pool=args.pool,
         codes=str(out),
     ), idx)
     print(f"[save] {out}  {out.stat().st_size/2**20:.1f} MiB", flush=True)
