@@ -1087,9 +1087,11 @@ def main() -> int:
                     miss += 1
                     continue
                 sp = q.get("split", "train")
+                clen = (source_idx[u][2] if args.codes
+                        else source_idx[u][2] // P)
                 item = ({"uid": u, "sequence": q.get("sequence", "")},
                         {"question": q["question"], "answer": q["answer"]},
-                        source_idx[u][2] // P, source_idx[u][1])
+                        clen, source_idx[u][1])
                 buckets.get(sp, tr).append(item)
         if miss:
             kind = "码缓存" if args.codes else "隐藏态缓存"
