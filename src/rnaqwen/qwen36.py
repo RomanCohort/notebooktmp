@@ -634,8 +634,16 @@ def load_qwen36_text(mode: str = "int4", smoke: int = -1, min_free: float = 0.0,
 
     patch_moe_experts(M)
     log(f"[qwen36] 专家类已替换为 per-expert nn.Linear（含 _init_weights 包装）")
-    patch_conv1d(M)
-    log(f"[qwen36] linear_attention 的 Conv1d 已换成等价实现（MIOpen 不支持 Conv1d）")
+
+    # patch_conv1d 是 ROCm 专属补丁：MIOpen 在 gfx1151 上对 Conv1d 报
+    # miopenStatusInternalError，所以换成 4 次移位乘加。CUDA 上 cuDNN 的
+    # Conv1d 又快又对，打上这个补丁只会用 Python 循环替换融合算子，纯亏。
+    _is_rocm = getattr(torch.version, "hip", None) is not None
+    if _is_rocm:
+        patch_conv1d(M)
+        log(f"[qwen36] ROCm 检测到，linear_attention 的 Conv1d 已换成等价实现")
+    else:
+        log(f"[qwen36] CUDA 检测到，保留原生 Conv1d（跳过 MIOpen 补丁）")
 
     with torch.device("meta"):
         model = M.Qwen3_5MoeForConditionalGeneration(cfg_vlm)

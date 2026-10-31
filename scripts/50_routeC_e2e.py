@@ -898,6 +898,11 @@ def main() -> int:
     ap.add_argument("--token-budget", type=int, default=6000,
                     help="每步 B*T 上限：B=样例数，T=压缩码长+问题/答案文本 token。"
                          "只数码长的话，长答案的数据会把 B*T 顶到几倍大 -> OOM")
+    ap.add_argument("--grad-ckpt", type=int, default=0,
+                    help="1 = 打开 gradient checkpointing。40GB 的 A100 上 int4 底座占 "
+                         "18.2 GiB，剩下的激活空间不够 B*T=2048；打开后用约 30%% 速度"
+                         "换 2-4 倍的 token-budget。冻结底座 + LoRA/SOS 时必须同时 "
+                         "enable_input_require_grads，否则梯度断在 inputs_embeds 上。")
     ap.add_argument("--bucket", type=int, default=256,
                     help="长度分桶的桶大小；0=不分桶")
     ap.add_argument("--save-dir", default="", help="最终产物目录")
@@ -1148,6 +1153,38 @@ def main() -> int:
     if tk.base_vocab != model.base_vocab:
         print(f"[vocab] **不一致**，以 embedding 的 {model.base_vocab} 为准")
         tk.base_vocab = model.base_vocab
+
+    if args.grad_ckpt:
+        # 冻结底座 + LoRA/SOS 时，transformer 的 checkpoint 需要输入 requires_grad，
+        # 否则重算阶段拿不到梯度，backward 会静默变成空操作。
+        enabled = False
+        for target in (model.llm, getattr(model.llm, "model", None)):
+            if target is None:
+                continue
+            try:
+                target.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
+                enabled = True
+                break
+            except TypeError:
+                try:
+                    target.gradient_checkpointing_enable()
+                    enabled = True
+                    break
+                except Exception as exc:                     # noqa: BLE001
+                    print(f"[ckpt] {type(target).__name__}: {exc}")
+            except Exception as exc:                         # noqa: BLE001
+                print(f"[ckpt] {type(target).__name__}: {exc}")
+        if enabled:
+            try:
+                model.llm.enable_input_require_grads()
+            except Exception as exc:                         # noqa: BLE001
+                print(f"[ckpt] enable_input_require_grads 失败: {exc}")
+            print("[ckpt] gradient checkpointing 已打开（use_reentrant=False）")
+        else:
+            raise RuntimeError(
+                "--grad-ckpt 1 但底座没有 gradient_checkpointing_enable()，"
+                "拒绝在没开成的情况下继续（否则会白跑一轮 OOM）")
     # ---- 每步的真实步长 ----
     # 显存跟着 B*T 走（B=每步样例数，T=补齐后的序列长度），而 --token-budget 原先只
     # 累加压缩码长 clen，**完全没算问题和答案的文本 token**：seqtask 的答案是 6~8 个

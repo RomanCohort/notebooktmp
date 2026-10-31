@@ -158,6 +158,24 @@ def install(verbose: bool = False) -> bool:
     import torch  # noqa: F401
     import torch.distributed  # noqa: F401
 
+    # 先判断这个 torch 到底残不残。CUDA 官方轮子这几样全都有，
+    # 那就什么都不该改 —— 尤其不该把 torch.distributed.__class__ 换掉，
+    # 那会把真实缺失的属性变成静默占位符，掩盖真正的错误。
+    healthy = True
+    for probe in ("torch.distributed.checkpoint",
+                  "torch.distributed.distributed_c10d",
+                  "torch.distributed.tensor"):
+        try:
+            __import__(probe)
+        except Exception:
+            healthy = False
+            break
+    if healthy and hasattr(torch.distributed, "ReduceOp"):
+        marker.installed = []
+        if verbose:
+            print("[shim] healthy torch.distributed, nothing patched")
+        return True
+
     installed: list[str] = []
 
     # ---- 1. torch.distributed.checkpoint (+ .state_dict) -------------------
