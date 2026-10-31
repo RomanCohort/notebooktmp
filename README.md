@@ -35,6 +35,11 @@ fine-grained GitHub token with Contents read/write permission and add it to
 Colab Secrets as `GITHUB_TOKEN`. The notebook stores the latest checkpoint in a
 release tagged `train-v3-checkpoints`.
 
+Checkpoints are saved every 100 steps or every 10 minutes, whichever comes
+first. The local runtime keeps the newest three snapshots. The background GitHub
+sync uploads the newest complete snapshot before deleting the previous release
+asset.
+
 The code cache is runtime-local. A fresh Colab runtime regenerates it from the
 dataset and trained FSQ tokenizer before resuming. The FSQ encoder is frozen in
 this low-disk mode; the LLM adapter and code embedding table remain trainable.
