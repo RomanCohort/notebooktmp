@@ -51,12 +51,14 @@ budget. With a frozen base and LoRA/SOS adapters it must be paired with
 `scripts/50_routeC_e2e.py` does this automatically under `--grad-ckpt 1`, and
 raises if checkpointing could not be enabled.
 
-Qwen3.6 has 30 linear-attention layers. Install `flash-linear-attention[cuda]`
-and `causal-conv1d` before importing the model; otherwise Transformers falls
-back to the pure-PyTorch chunk/recurrent implementation and each step becomes
-far slower. The notebook attempts this installation and prints the detected
-kernel status. The trainer also prints `[profile]` timings for its first three
-steps: batch/data, model+LM loss, auxiliary loss, backward, and optimizer.
+Qwen3.6 has 30 linear-attention layers. The notebook requires both
+`flash-linear-attention[cuda]` and `causal-conv1d` before importing the model;
+otherwise Transformers falls back to the pure-PyTorch chunk/recurrent
+implementation and each step becomes far slower. FLA is installed from its
+wheel. `causal-conv1d` is installed only from the exact official GitHub release
+wheel matching Python, torch, CUDA, and C++ ABI, and the notebook never falls
+back to a source build. The trainer prints `[profile]` timings for its first
+three steps: batch/data, model+LM loss, auxiliary loss, backward, and optimizer.
 
 If `--token-budget 2048` still OOMs, drop to `1536` first; only fall back to
 `1024` if that fails too.

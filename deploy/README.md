@@ -42,7 +42,9 @@ sudo -u rnaqwen /opt/RNAQwen/.venv/bin/pip install \
 sudo -u rnaqwen /opt/RNAQwen/.venv/bin/pip install -r /opt/RNAQwen/requirements.txt
 # CUDA only: enables the FLA/causal-conv1d fast path for linear attention.
 sudo -u rnaqwen /opt/RNAQwen/.venv/bin/pip install \
-  'flash-linear-attention[cuda]==0.6.0' 'causal-conv1d==1.7.0'
+  'flash-linear-attention[cuda]==0.6.0'
+# Required: install causal-conv1d only from its matching official release wheel.
+# Do not run plain `pip install causal-conv1d`; PyPI is source-only and will compile.
 ```
 
 Verify:
