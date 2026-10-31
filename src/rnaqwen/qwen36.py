@@ -267,29 +267,25 @@ def make_quant_experts_cls(base_cls):
         def forward(self, hidden_states, top_k_index, top_k_weights):
             final_hidden_states = torch.zeros_like(hidden_states)
             with torch.no_grad():
-                expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                # **一次同步取出 Python 列表。**
-                #
-                # 原来写的是 `for expert_idx in expert_hit: e = int(expert_idx[0])`
-                # —— `expert_hit` 是 GPU 张量，`int()` 每取一个元素就做一次
-                # GPU->CPU 同步。而 batch 小的时候 top-8 路由到 256 个专家上
-                # **几乎全部命中**，40 层就是每步约一万次同步。
-                #
-                # 实测（scripts/92_moe_bench.py，固定样本总数只改 batch）：
-                #     batch 1 -> 8：每步 10.50s -> 12.57s（只 1.20x）
-                #                   每样本 10.500s -> 4.191s
-                # 8 倍样本只花 1.2 倍时间 -> **启动/同步延迟主导，不是算力**。
-                #
-                # .tolist() 只同步一次，取值和顺序与逐个 int() 完全一致
-                # （nonzero 按索引升序，flatten/tolist 保序），所以数学上等价。
-                hit = torch.greater(
-                    expert_mask.sum(dim=(-1, -2)), 0).nonzero().flatten().tolist()
+                num_slots = top_k_index.size(-1)
+                expert_ids = top_k_index.reshape(-1)
+                slots = torch.arange(
+                    expert_ids.numel(), device=expert_ids.device) % num_slots
+                # Sort by (expert, top-k slot, token), matching the old
+                # expert-mask/where order while avoiding the [T,K,E] one-hot tensor
+                # and 256 separate torch.where() dispatches per layer.
+                order = torch.argsort(expert_ids * num_slots + slots, stable=True)
+                counts = torch.bincount(
+                    expert_ids, minlength=self.num_experts).to(torch.int64).tolist()
 
-            for e in hit:
-                if e == self.num_experts:
+            start = 0
+            for e, count in enumerate(counts):
+                if count == 0:
                     continue
-                top_k_pos, token_idx = torch.where(expert_mask[e])
+                flat_pos = order[start:start + count]
+                start += count
+                token_idx = torch.div(flat_pos, num_slots, rounding_mode="floor")
+                top_k_pos = flat_pos - token_idx * num_slots
                 current_state = hidden_states[token_idx]
                 gate, up = self.gate_up[e](current_state).chunk(2, dim=-1)
                 cur = self.act_fn(gate) * up

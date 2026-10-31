@@ -51,6 +51,13 @@ budget. With a frozen base and LoRA/SOS adapters it must be paired with
 `scripts/50_routeC_e2e.py` does this automatically under `--grad-ckpt 1`, and
 raises if checkpointing could not be enabled.
 
+Qwen3.6 has 30 linear-attention layers. Install `flash-linear-attention[cuda]`
+and `causal-conv1d` before importing the model; otherwise Transformers falls
+back to the pure-PyTorch chunk/recurrent implementation and each step becomes
+far slower. The notebook attempts this installation and prints the detected
+kernel status. The trainer also prints `[profile]` timings for its first three
+steps: batch/data, model+LM loss, auxiliary loss, backward, and optimizer.
+
 If `--token-budget 2048` still OOMs, drop to `1536` first; only fall back to
 `1024` if that fails too.
 
@@ -60,6 +67,12 @@ newest checkpoint each time; the step counter is restored, so `--min-steps`
 accumulates across segments. The dataset has 1,060,818 QA rows total
 (831,390 train / 66,796 val / 162,632 test), so 46,500 steps must not be
 described as one epoch. Sampling is without replacement inside each epoch.
+
+Measure the first few step timestamps before committing to the long run. One
+observed A100 40GB segment ran at about 29 s/step after model load: 46,500 steps
+would take about 15 days and roughly 50 Colab segments. 100 compute units are
+not enough for that schedule; use a shorter pilot, a persistent GPU, or a larger
+token budget only after checking VRAM headroom.
 
 Checkpoint sync is optional. To persist training across Colab runtimes, create a
 fine-grained GitHub token with Contents read/write permission and add it to

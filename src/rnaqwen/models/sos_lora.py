@@ -131,17 +131,13 @@ class SOSLoRALayer(nn.Module):
         """
         if self.k <= 1:
             return torch.zeros((), device=self.A[0].device)
-        flat = torch.cat([a.reshape(-1) for a in self.A], dim=0)
-        flat = flat / flat.norm().clamp_min(1e-9)
-        # 每个专家的方向向量
-        vs = [a.reshape(-1) / a.reshape(-1).norm().clamp_min(1e-9) for a in self.A]
-        pen = flat.new_zeros(())
-        n = 0
-        for i in range(self.k):
-            for j in range(i + 1, self.k):
-                pen = pen + (vs[i] @ vs[j]).pow(2)
-                n += 1
-        return pen / max(n, 1)
+        dirs = torch.stack([a.reshape(-1) for a in self.A], dim=0)
+        dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp_min(1e-9)
+        gram = dirs @ dirs.t()
+        offdiag = gram.masked_select(
+            ~torch.eye(self.k, dtype=torch.bool, device=gram.device)
+        )
+        return offdiag.pow(2).sum() / (self.k * (self.k - 1))
 
     # ---- 合并：ΔW = Σ s_k A_k B_k ----
     @torch.no_grad()

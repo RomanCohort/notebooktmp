@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -1005,6 +1006,8 @@ def main() -> int:
     ap.add_argument("--eval-every", type=int, default=150)
     ap.add_argument("--log-every", type=int, default=200,
                     help="每 N 步打一行日志。固定值，不跟总步数挂钩 —— steps//10 会让长训练几小时没输出")
+    ap.add_argument("--profile-steps", type=int, default=0,
+                    help="前 N 步输出 batch/forward/backward/optimizer 分段时间，0=关闭")
     ap.add_argument("--eval-n", type=int, default=25)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -1309,6 +1312,22 @@ def main() -> int:
     print(f"[tok] {base_dir.name}  vocab {tk0.vocab_size}  "
           f"im_start {tk.im_start[-4:]}  pad {tk.pad_id}  "
           f"no_think {len(tk.no_think)} token")
+    fast_path = {}
+    for module in ("fla", "causal_conv1d"):
+        try:
+            mod = importlib.import_module(module)
+            if module == "fla":
+                required = ("chunk_gated_delta_rule", "recurrent_gated_delta_rule")
+                missing = [x for x in required if not hasattr(mod, x)]
+                if missing:
+                    raise ImportError(f"fla missing {missing}")
+            fast_path[module] = getattr(mod, "__version__", "installed")
+        except Exception as exc:
+            fast_path[module] = None
+            print(f"[perf] {module} 未安装：{type(exc).__name__}")
+    print(f"[perf] linear-attention kernels: {fast_path}")
+    if not all(fast_path.values()):
+        print("[perf] ** 正在走纯 PyTorch fallback；30 层 linear attention 会非常慢 **")
     print("\n=== 建模型 ===")
     model = E2EModel(args.lora_r, args.rna_emb, latent=LATENT, levels=LEVELS,
                      pool=args.pool,
@@ -1522,6 +1541,10 @@ def main() -> int:
     _ver = {"d": [], "jit": []}      # 手工 loss 与 HF 的逐点差，累积后按中位数判（见下）
     last_step = start_step - 1
     for step in range(start_step, args.steps + 1):
+        profile = bool(args.profile_steps and step - start_step < args.profile_steps)
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_step = time.perf_counter()
         last_step = step
         ex = [tr_ex[i] for i in next(batch_stream)]
         ids, lab, am = build_batch(tk, ex)
@@ -1542,6 +1565,9 @@ def main() -> int:
             assert n_rna == v.shape[0], f"RNA 占位 {n_rna} != 向量 {v.shape[0]}：替换没生效"
             print(f"  [check] RNA 位置 {n_rna} 个，向量 {tuple(v.shape)} —— 替换已生效",
                   flush=True)
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_forward = time.perf_counter()
         emb = model.embed(ids, v)
         if args.answer_only_loss:
             loss = answer_only_loss(model, emb, am, lab)
@@ -1594,6 +1620,9 @@ def main() -> int:
             out = model.llm(inputs_embeds=emb, attention_mask=am, labels=lab, use_cache=False)
             loss = out.loss
 
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_lm_loss = time.perf_counter()
         codes = torch.cat(codes_all)
         hist = torch.bincount(codes, minlength=VOCAB).float()
         p = hist / hist.sum().clamp(min=1)
@@ -1624,11 +1653,36 @@ def main() -> int:
             from rnaqwen.models.sos_lora import sos_lora_penalty
             l_sos = args.sos_ortho_coef * sos_lora_penalty(model.llm)
         total = loss + l_ent + l_com + l_orth + l_sos
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_aux_done = time.perf_counter()
+        t_backward = time.perf_counter()
         total.backward()
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_after_backward = time.perf_counter()
         gn = (float(model.fsq.enc.weight.grad.norm())
               if model.fsq.enc.weight.grad is not None else -1)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step(); opt.zero_grad()
+        if profile and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_after_opt = time.perf_counter()
+        if profile:
+            print(
+                f"  [profile] step {step}  batch+data {t_forward-t_step:.2f}s  "
+                f"model+lm_loss {t_lm_loss-t_forward:.2f}s  "
+                f"aux_loss {t_aux_done-t_lm_loss:.2f}s  "
+                f"backward {t_after_backward-t_backward:.2f}s  "
+                f"opt {t_after_opt-t_after_backward:.2f}s  "
+                f"total {t_after_opt-t_step:.2f}s  "
+                f"samples {len(ex)}  eff_tokens {sum(_eff_len(x) for x in ex)}  "
+                f"verify={bool(args.verify_loss and step-start_step < args.verify_loss)}"
+                + (f"  vram {torch.cuda.memory_allocated()/2**30:.2f}/"
+                   f"{torch.cuda.memory_reserved()/2**30:.2f} GiB"
+                   if torch.cuda.is_available() else ""),
+                flush=True,
+            )
 
         # 修剪工作集：slice_hid 读 mmap 会把页 fault 进 WorkingSet，
         # 而 WorkingSet 计入常驻的文件映射页。不修剪的话空闲内存会一路下滑，

@@ -40,6 +40,9 @@ Install the PyTorch wheel matching the host CUDA driver, for example:
 sudo -u rnaqwen /opt/RNAQwen/.venv/bin/pip install \
   torch --index-url https://download.pytorch.org/whl/cu128
 sudo -u rnaqwen /opt/RNAQwen/.venv/bin/pip install -r /opt/RNAQwen/requirements.txt
+# CUDA only: enables the FLA/causal-conv1d fast path for linear attention.
+sudo -u rnaqwen /opt/RNAQwen/.venv/bin/pip install \
+  'flash-linear-attention[cuda]==0.6.0' 'causal-conv1d==1.7.0'
 ```
 
 Verify:

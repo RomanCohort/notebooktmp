@@ -7,3 +7,7 @@ sentencepiece==0.2.2
 huggingface_hub==1.33.0
 multimolecule==0.2.1
 requests>=2.32
+
+# CUDA training fast path for Qwen3.6 linear attention:
+# flash-linear-attention[cuda]==0.6.0
+# causal-conv1d==1.7.0
