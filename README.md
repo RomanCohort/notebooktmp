@@ -25,7 +25,7 @@ The notebook:
 
 1. clones this repository;
 2. downloads ERNIE-RNA and Qwen3.6-35B-A3B;
-3. generates the 68 GiB ERNIE hidden-state cache inside Colab;
+3. streams ERNIE hidden states into a compact uint16 code cache (about 100 MiB);
 4. runs a 10-step smoke test;
 5. runs resumable full training.
 
@@ -34,8 +34,9 @@ fine-grained GitHub token with Contents read/write permission and add it to
 Colab Secrets as `GITHUB_TOKEN`. The notebook stores the latest checkpoint in a
 release tagged `train-v3-checkpoints`.
 
-The hidden-state cache is runtime-local because it is too large for a GitHub
-repository. A fresh Colab runtime must regenerate it before resuming training.
+The code cache is runtime-local. A fresh Colab runtime regenerates it from the
+dataset and trained FSQ tokenizer before resuming. The FSQ encoder is frozen in
+this low-disk mode; the LLM adapter and code embedding table remain trainable.
 
 ## Released assets
 

@@ -60,6 +60,8 @@ HID_TENSOR = None  # 由 main 赋值；hid_slice 要用（保留兼容单个缓�
 # 多缓存：uid -> (cache_key, offset, length)，以及 cache_key -> 张量
 HIDS = {}
 IDX = {}
+CODES = None
+CODE_IDX = {}
 
 
 def register_cache(key, x, lens, offsets, uids):
@@ -324,6 +326,16 @@ class E2EModel(nn.Module):
         self.fsq_usage = torch.stack(self._usage_parts).mean(0)
         return out, code, t, q
 
+    def rna_vectors_from_codes(self, code, perm=None):
+        """Precomputed FSQ code IDs -> trainable code embeddings.
+
+        This path deliberately freezes the FSQ encoder: the trained tokenizer is
+        treated as a discrete RNA tokenizer. Only the LLM adapter and embedding
+        table are trained.
+        """
+        idx = perm[code] if perm is not None else code
+        return self.rna_emb(idx), code, None, None
+
     def embed(self, ids, rna_vecs):
         is_rna = ids >= self.base_vocab
         safe = ids.clamp(max=self.base_vocab - 1)
@@ -332,6 +344,15 @@ class E2EModel(nn.Module):
             e = e.clone()
             e[is_rna] = rna_vecs.to(e.dtype)
         return e
+
+
+def vectors_for_uid(model, uid, perm=None, tau=TAU):
+    """Return (vectors, codes, q_ste, target) from codes or hidden states."""
+    if CODES is not None:
+        c = CODE_IDX[uid]
+        code = CODES[c[1]:c[1] + c[2]].to(DEV, dtype=torch.long)
+        return model.rna_vectors_from_codes(code, perm=perm)
+    return model.rna_vectors(slice_hid(uid), perm=perm, tau=tau)
 
 
 # ---------------------------------------------------------------- batch
@@ -430,8 +451,7 @@ def per_token_logp(model, tk, examples, hid, perm=None, mode="real", max_n=25):
 
     out, out_ans, used = [], [], set()
     for r, qa, clen, off in examples[:max_n]:
-        x = slice_hid(r["uid"])
-        v, code, _, _ = model.rna_vectors(x, perm=perm, tau=TAU)
+        v, code, _, _ = vectors_for_uid(model, r["uid"], perm=perm, tau=TAU)
         used |= set(code.tolist())
         ids, lab, am = build_batch(tk, [(r, qa, clen, off)])
         emask = answer_token_mask(tk, qa, lab)          # [1, T]
@@ -514,8 +534,7 @@ def val_ce(model, tk, ex_list, arm="A", max_n=25):
     """
     per_ex = []
     for r, qa, clen, off in spread(ex_list, max_n):
-        x = hid_slice(off, clen, uid=r.get("uid"))
-        v, _, _, _ = model.rna_vectors(x, tau=TAU)
+        v, _, _, _ = vectors_for_uid(model, r.get("uid"), tau=TAU)
         if arm == "C":
             v = torch.zeros_like(v)
         ids, lab, am = build_batch(tk, [(r, qa, clen, off)])
@@ -551,8 +570,7 @@ def _logp_of(model, tk, ex_list):
     """
     out, used = [], set()
     for r, qa, clen, off in ex_list:
-        x = hid_slice(off, clen, uid=r.get("uid"))
-        v, code, _, _ = model.rna_vectors(x, tau=TAU)
+        v, code, _, _ = vectors_for_uid(model, r.get("uid"), tau=TAU)
         if len(v) != clen:
             raise RuntimeError(
                 f"RNA code length mismatch: got {len(v)}, placeholder expects {clen} "
@@ -908,6 +926,11 @@ def main() -> int:
     ap.add_argument("--hid", default="",
                     help="主隐藏态缓存。留空且给了 --hid2 时跳过旧主缓存，"
                          "适合只加载按新数据生成的一份 cache。")
+    ap.add_argument("--codes", default="",
+                    help="预计算 FSQ 码 ID 的 uint16 memmap。给定时冻结 FSQ，"
+                         "只训练 LLM adapter 和码 embedding。")
+    ap.add_argument("--codes-idx", default="",
+                    help="--codes 对应的 uid/offset/length 索引。")
     ap.add_argument("--diag", type=int, default=1, help="每个 eval 点跑诊断套件")
     ap.add_argument("--diag-n", type=int, default=40, help="诊断用多少条样本")
     # ---- 换底座 ----
@@ -956,6 +979,8 @@ def main() -> int:
                          "换码表时必须同时用 --init-code-emb 给配套的内容初始化码表，"
                          "否则 rna_emb 与码 ID 语义错位。")
     args = ap.parse_args()
+    if bool(args.codes) != bool(args.codes_idx):
+        raise SystemExit("--codes 与 --codes-idx 必须同时提供")
     if args.fsq:
         global FSQ_CKPT
         FSQ_CKPT = Path(args.fsq)
@@ -971,22 +996,38 @@ def main() -> int:
     print(f"[out] {outdir}\n[rna-emb] {args.rna_emb}  ent {args.ent_coef}  "
           f"commit {args.commit_coef}  ortho {args.ortho_coef}")
 
-    global HID_TENSOR
-    primary_hid = Path(args.hid) if args.hid else HID
-    use_primary = primary_hid.exists() or not args.hid2
+    global HID_TENSOR, CODES, CODE_IDX
     hid, lens, offsets = None, [], []
     allr = []
     off_of, len_of = {}, {}
-    if use_primary:
-        d = torch.load(primary_hid, map_location="cpu", weights_only=False)
-        hid, lens, offsets = d["x"], d["lens"], d["offsets"]
-        HID_TENSOR = hid
-        print(f"[hid] 主缓存 {hid.shape} 序列 {len(lens)}  来自 {primary_hid.name}")
+    use_primary = False
+    if args.codes:
+        import numpy as np
+        print(f"[codes] 1/3 torch.load 索引 {args.codes_idx}", flush=True)
+        dc = torch.load(args.codes_idx, map_location="cpu", weights_only=False)
+        mmc = np.memmap(args.codes, dtype=np.uint16, mode="r",
+                        shape=(int(dc["n_pos"]),))
+        CODES = torch.from_numpy(mmc)
+        CODE_IDX = {
+            uid: ("codes", int(dc["offsets"][i]), int(dc["lens"][i]))
+            for i, uid in enumerate(dc["uids"])
+        }
+        print(f"[codes] 2/3 memmap ok  {tuple(mmc.shape)}  vocab={dc['vocab']}", flush=True)
+        print(f"[codes] 3/3 uid={len(CODE_IDX):,}  来自 {Path(args.codes).name}", flush=True)
+        print("[codes] FSQ encoder 冻结；训练 LLM adapter + code embedding", flush=True)
     else:
-        print(f"[hid] 跳过主缓存；只使用 --hid2 {args.hid2}")
+        primary_hid = Path(args.hid) if args.hid else HID
+        use_primary = primary_hid.exists() or not args.hid2
+        if use_primary:
+            d = torch.load(primary_hid, map_location="cpu", weights_only=False)
+            hid, lens, offsets = d["x"], d["lens"], d["offsets"]
+            HID_TENSOR = hid
+            print(f"[hid] 主缓存 {hid.shape} 序列 {len(lens)}  来自 {primary_hid.name}")
+        else:
+            print(f"[hid] 跳过主缓存；只使用 --hid2 {args.hid2}")
 
     # 第二份缓存（rfam）：uid 是裸 md5，且是 np.memmap 不是 torch 张量
-    if args.hid2:
+    if args.hid2 and not args.codes:
         import numpy as np
         print(f"[hid2] 1/4 torch.load 索引 {args.hid2_idx}", flush=True)
         d2 = torch.load(args.hid2_idx, map_location="cpu", weights_only=False)
@@ -1036,16 +1077,18 @@ def main() -> int:
                     continue
                 q = json.loads(line)
                 u = q.get("uid")
-                if u not in IDX:
+                source_idx = CODE_IDX if args.codes else IDX
+                if u not in source_idx:
                     miss += 1
                     continue
                 sp = q.get("split", "train")
                 item = ({"uid": u, "sequence": q.get("sequence", "")},
                         {"question": q["question"], "answer": q["answer"]},
-                        IDX[u][2] // P, IDX[u][1])
+                        source_idx[u][2] // P, source_idx[u][1])
                 buckets.get(sp, tr).append(item)
         if miss:
-            print(f"[warn] {miss:,} 条 QA 的 uid 不在隐藏态缓存里")
+            kind = "码缓存" if args.codes else "隐藏态缓存"
+            print(f"[warn] {miss:,} 条 QA 的 uid 不在{kind}里")
         return tr, va, te
 
     POOL = args.pool
@@ -1169,13 +1212,16 @@ def main() -> int:
                 f"或用 --no-fsq-init 显式声明要随机初始化。")
         print(f"[init] FSQ.enc 载入 {len(sd)} 个张量"
               + (f"，跳过形状不符的 {skipped}" if skipped else ""))
+    if args.codes:
+        for p in model.fsq.parameters():
+            p.requires_grad_(False)
     n_lora = sum(p.numel() for p in model.llm.parameters() if p.requires_grad)
     n_fsq = sum(p.numel() for p in model.fsq.parameters())
     n_tab = model.rna_emb.weight.numel() if model.rna_emb is not None else 0
     print(f"  LoRA {n_lora:,}  FSQ+head {n_fsq:,}  码表 {n_tab:,}")
 
     params = ([p for p in model.llm.parameters() if p.requires_grad]
-              + list(model.fsq.parameters())
+              + ([] if args.codes else list(model.fsq.parameters()))
               + ([model.rna_emb.weight] if model.rna_emb is not None else []))
     opt = torch.optim.AdamW(params, lr=args.lr)
     w_init = (model.rna_emb.weight.detach().clone()
@@ -1270,7 +1316,7 @@ def main() -> int:
         model.reset_usage()          # 不清空的话，fsq_usage 会跨步累积
         vecs, codes_all, t_all, q_all = [], [], [], []
         for r, qa, clen, off in ex:
-            v, c, t, q = model.rna_vectors(slice_hid(r["uid"]), tau=TAU)
+            v, c, t, q = vectors_for_uid(model, r["uid"], tau=TAU)
             vecs.append(v); codes_all.append(c); t_all.append(t); q_all.append(q)
         v = torch.cat(vecs)
         if step == 1 or step % max(1, args.log_every) == 0:
@@ -1348,7 +1394,10 @@ def main() -> int:
             l_ent = (u * (u + 1e-9).log()).sum() * args.ent_coef    # 最小化 -> 最大化熵
         else:
             l_ent = torch.zeros((), device=DEV)
-        l_com = args.commit_coef * F.mse_loss(torch.cat(t_all), torch.cat(q_all))
+        if t_all:
+            l_com = args.commit_coef * F.mse_loss(torch.cat(t_all), torch.cat(q_all))
+        else:
+            l_com = torch.zeros((), device=DEV)
         l_orth = torch.zeros((), device=DEV)
         if args.ortho_coef and model.rna_emb is not None:
             u = torch.unique(codes)
@@ -1364,7 +1413,8 @@ def main() -> int:
             l_sos = args.sos_ortho_coef * sos_lora_penalty(model.llm)
         total = loss + l_ent + l_com + l_orth + l_sos
         total.backward()
-        gn = float(model.fsq.enc.weight.grad.norm()) if model.fsq.enc.weight.grad is not None else -1
+        gn = (float(model.fsq.enc.weight.grad.norm())
+              if model.fsq.enc.weight.grad is not None else -1)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step(); opt.zero_grad()
 
