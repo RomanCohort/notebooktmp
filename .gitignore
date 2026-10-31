@@ -1,6 +1,7 @@
 /data/
 /models/
 /runs/
+/checkpoints/fsq_stream/*.pt
 __pycache__/
 *.pyc
 *.part
