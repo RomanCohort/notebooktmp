@@ -65,6 +65,20 @@ jobs:
             https://github.com/Dao-AILab/causal-conv1d.git /tmp/causal-conv1d
           mkdir -p wheelhouse
           cd /tmp/causal-conv1d
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("setup.py")
+          source = path.read_text()
+          start = source.index('        cc_flag.append("-gencode")')
+          end = source.index("    # HACK:", start)
+          replacement = '''        cc_flag.extend([
+                      "-gencode", "arch=compute_80,code=sm_80",
+                      "-gencode", "arch=compute_80,code=compute_80",
+                  ])
+
+          '''
+          path.write_text(source[:start] + replacement + source[end:])
+          PY
           python -m pip wheel . --no-deps --no-build-isolation \
             -w "$GITHUB_WORKSPACE/wheelhouse"
           cd "$GITHUB_WORKSPACE"
@@ -72,8 +86,8 @@ jobs:
           test "$(find wheelhouse -name '*.whl' | wc -l)" -eq 1
           WHEEL="$(find wheelhouse -name '*.whl' -print -quit)"
           echo "$WHEEL" | grep -q 'cp313-cp313-linux_x86_64'
-          echo "$WHEEL" | grep -q 'torch2.11cxx11abiTRUE'
-          echo "$WHEEL" | grep -q 'cu13'
+          echo "$WHEEL" | grep -qi 'torch2.11cxx11abitrue'
+          echo "$WHEEL" | grep -qi 'cu13'
           sha256sum "$WHEEL" | tee wheelhouse/SHA256SUMS.txt
 
       - name: Verify wheel import
