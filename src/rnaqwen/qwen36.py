@@ -152,7 +152,7 @@ def trim_working_set() -> bool:
 
 
 def free_gb() -> float:
-    """系统物理空闲内存（GiB）。APU 上 mem_get_info() 会撒谎，只有这个可信。
+    """系统可用内存（GiB），Windows 和 Linux 都返回真实读数。
 
     **但这个数不是模型占用**：它同时被 page cache 和进程 RSS 影响。
     排除法实测（2026-10-12）：
@@ -160,38 +160,47 @@ def free_gb() -> float:
       · 每层显存只涨 0.456 GiB，而系统空闲掉 1.1 GiB
       -> 差额在**主机内存**上，要看 rss_gb() 才分得开
     """
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
+                capture_output=True, text=True).stdout.strip()
+            return float(out) / 1024 / 1024
+        except (ValueError, OSError):
+            return -1.0
     try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
-            capture_output=True, text=True).stdout.strip()
-        return float(out) / 1024 / 1024
-    except (ValueError, OSError):
-        return -1.0
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / 1024 / 1024
+    except (OSError, ValueError):
+        pass
+    return -1.0
 
 
 def rss_gb() -> float:
-    """本进程的工作集（GiB）。用来把「模型显存」和「主机内存」分开。
+    """本进程常驻内存（GiB）。用来把「模型显存」和「主机内存」分开。
 
     **必须用 os.getpid()。** 在 `powershell -Command` 里 `$PID` 是
     PowerShell 自己的进程号，不是 Python 的 —— 那样量出来的永远是 0.07 GiB，
     看起来"进程没占内存"，会误导排查方向。
     """
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"[math]::Round((Get-Process -Id {os.getpid()}).WorkingSet64/1GB,3)"],
+                capture_output=True, text=True).stdout.strip()
+            return float(out)
+        except (ValueError, OSError):
+            return -1.0
     try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"[math]::Round((Get-Process -Id {os.getpid()}).WorkingSet64/1GB,3)"],
-            capture_output=True, text=True).stdout.strip()
-        return float(out)
-    except (ValueError, OSError):
-        return -1.0
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
-            capture_output=True, text=True).stdout.strip()
-        return float(out) / 1024 / 1024
-    except (ValueError, OSError):
+        with open("/proc/self/statm", encoding="ascii") as fh:
+            resident_pages = int(fh.read().split()[1])
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return resident_pages * page_size / 2 ** 30
+    except (OSError, ValueError, IndexError):
         return -1.0
 
 
@@ -204,6 +213,9 @@ def commit_gb() -> tuple[float, float]:
     （2026-10-14 实测，见 ShardReader 的 docstring）。
     `free_gb()` 量不到这一层，所以两个都要看。
     """
+    if os.name != "nt":
+        return -1.0, -1.0
+
     import ctypes
 
     class _PERF(ctypes.Structure):
