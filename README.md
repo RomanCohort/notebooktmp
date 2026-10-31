@@ -42,4 +42,5 @@ this low-disk mode; the LLM adapter and code embedding table remain trainable.
 ## Released assets
 
 - Dataset: https://github.com/RomanCohort/notebooktmp/releases/tag/dataset-v3
+- FSQ checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/fsq-stream-v1
 - Checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/train-v3-checkpoints
