@@ -1700,8 +1700,10 @@ def main() -> int:
         if step % max(1, args.log_every) == 0 or step == 1:
             drift = (float((model.rna_emb.weight.detach() - w_init).norm() / w_init.norm())
                      if w_init is not None else 0.0)
+            step_secs = time.perf_counter() - t_step
             print(f"  step {step:>5}  ce {float(loss):.4f}  ent {ent:.3f}  "
-                  f"|grad_fsq {gn:.3e}|  码表漂移 {100*drift:.1f}%  {time.time()-t0:.0f}s",
+                  f"|grad_fsq {gn:.3e}|  码表漂移 {100*drift:.1f}%  "
+                  f"{step_secs:.1f}s/step  elapsed {time.time()-t0:.0f}s",
                   flush=True)
             if step % max(1, args.log_every * 5) == 0:
                 try:
