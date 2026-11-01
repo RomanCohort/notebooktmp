@@ -58,13 +58,17 @@ per layer — each dequantizes a small weight and then does a small GEMM — so 
 GPU spends most of its time waiting between launches instead of computing.
 
 Training now uses `--experts grouped` by default. It sorts routes by expert,
-dequantizes the hit experts' int4 weights into one contiguous buffer, and runs
-two `bmm` ops per layer instead of the per-expert loop. The base weights stay
-frozen; autograd propagates only to `hidden_states`. On an A100 40GB, one
-real-shape layer (256 experts, hidden 2048, intermediate 512, 8192 tokens, top-8)
-measured **4.99x** faster forward+backward than the per-expert path, with
-`max|Δforward| ≈ 3.9e-3` in bf16 and peak layer VRAM rising from ~1.2 to ~3.6
-GiB (transient, under `--grad-ckpt 1`).
+batch-dequantizes the hit experts' int4 weights into one contiguous buffer
+(nested double-quant absmax reconstructed for all experts at once), and runs two
+`bmm` ops per layer instead of the per-expert loop. The base weights stay frozen;
+autograd propagates only to `hidden_states`. On an A100 40GB, one real-shape
+layer (256 experts, hidden 2048, intermediate 512, 8192 tokens, top-8) measured
+**14.3x** faster forward+backward than the per-expert path (0.405 s → 0.027 s),
+with `max|Δforward| ≈ 3–8e-3` in bf16 and peak layer VRAM rising from ~1.2 to
+~3.6 GiB (transient, under `--grad-ckpt 1`). The batched dequant is bit-identical
+to the per-expert `dequantize_4bit` path; profiling showed the remaining per-layer
+cost is now the routed-token gather/scatter plus the `bmm` GEMMs, not dequant
+launches.
 
 `torch._grouped_mm` is not used: on torch 2.11.0+cu130 its backward raises
 `Invalid strides/sizes`, and bnb's `matmul_4bit` requires a 2D `quant_state`, so
