@@ -27,8 +27,11 @@ The notebook:
 2. downloads ERNIE-RNA and Qwen3.6-35B-A3B;
 3. downloads the published 25 MiB uint16 code cache (or regenerates it from the
    final dataset and FSQ tokenizer as a fallback);
-4. runs a 10-step smoke test;
-5. runs resumable full training.
+4. runs resumable full training directly.
+
+The full-run cell prints `[gpu]` utilization and VRAM every three seconds,
+writes `runs/e2e_v3_full/gpu_metrics.csv`, and reports min/median/mean/max GPU
+utilization when the segment exits. No smoke test is run.
 
 ## A100 40GB settings
 
