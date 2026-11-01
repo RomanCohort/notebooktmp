@@ -31,7 +31,7 @@ The notebook:
 
 The full-run cell prints `[gpu]` utilization and VRAM every three seconds,
 writes `runs/e2e_v3_full/gpu_metrics.csv`, and reports min/median/mean/max GPU
-utilization when the segment exits. No smoke test is run.
+utilization when the segment exits.
 
 ## A100 40GB settings
 
