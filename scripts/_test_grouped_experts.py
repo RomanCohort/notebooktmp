@@ -58,6 +58,21 @@ def main() -> int:
     dev = "cuda"
     torch.manual_seed(0)
     m = build(dev)
+
+    # ---- 批量反量化必须与逐专家反量化逐位一致 ----
+    from bitsandbytes.functional import dequantize_4bit  # noqa: E402
+    from rnaqwen.qwen36 import _dequant_experts_batched  # noqa: E402
+    gws = [m.gate_up[e].weight for e in range(m.num_experts)]
+    shp = tuple(gws[0].quant_state.shape)
+    bd = _dequant_experts_batched(gws, (len(gws),) + shp, gws[0].data.device)
+    rd = torch.stack([dequantize_4bit(w.data.view(-1, 1), w.quant_state)
+                      for w in gws])
+    dd = (bd - rd).abs().max().item()
+    print(f"batched-dequant max|diff| vs per-expert {dd:.3e}")
+    if dd > 1e-6:
+        print("FAIL: 批量反量化与逐专家不一致")
+        return 1
+
     T, H, K = 16, _Cfg.hidden_size, 2
     x = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
     idx = torch.randint(0, _Cfg.num_experts, (T, K), device=dev)

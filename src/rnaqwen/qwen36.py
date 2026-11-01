@@ -266,6 +266,58 @@ def commit_gb() -> tuple[float, float]:
     return m.CommitTotal * gb, m.CommitLimit * gb
 
 
+def _dequant_experts_batched(weights, out_shape, dev):
+    """把一组形状相同的 4bit 权重一次性反量化到 [E, out, in] 的一块缓存。
+
+    为什么需要（实测瓶颈）
+    ----------------------
+    grouped 路径最早是逐专家调用 bnb.dequantize_4bit：每层命中 ~256 个专家，
+    gate_up + down 合计约 512 次反量化 kernel。每次只处理一个小权重，GPU 在两次
+    launch 之间空转 —— 这就是「GPU 利用率低」的另一半根因（GEMM 已经用 bmm 批量
+    化，反量化还是碎 kernel）。这里把命中专家的 packed int4 和还原后的浮点
+    absmax 各堆成一个大张量，用一次 raw op 处理整层。
+
+    nested double-quant 的还原
+    --------------------------
+    compress_statistics=True 时 quant_state.nested=True：第一级 absmax 被量化成
+    uint8 码，用第二级 state2 还原。bnb 自己的做法（functional.dequantize_4bit）是
+        absmax = dequantize_blockwise(qs.absmax, qs.state2) + qs.offset
+    这里照抄，再把每个专家的浮点 absmax 拼成一维 [E * num_blocks]。
+
+    为什么直接调 raw op
+    -------------------
+    `dequantize_4bit` 的 Python 包装里有个 BC 补丁：A.shape[0] == 1 时把输出转置。
+    批量 A 的 shape[0] 是专家数，直接走 raw op 才不会被这条规则误伤（E == 1 时
+    也不会把整块输出转置掉）。
+    """
+    from bitsandbytes.functional import dequantize_blockwise
+
+    qs0 = weights[0].quant_state
+    blocksize = qs0.blocksize
+    quant_type = qs0.quant_type
+    dtype = qs0.dtype
+    packed, absmax = [], []
+    for w in weights:
+        qs = w.quant_state
+        packed.append(w.data.reshape(-1))
+        if qs.nested:
+            am = dequantize_blockwise(qs.absmax, qs.state2)
+            off = getattr(qs, "offset", None)
+            if off is not None:
+                am = am + off
+            am = am.float()
+        else:
+            am = qs.absmax.float()
+        absmax.append(am.reshape(-1))
+
+    A = torch.stack(packed)                      # [E, packed]
+    AM = torch.stack(absmax).reshape(-1)         # [E * num_blocks]
+    out = torch.empty(out_shape, dtype=dtype, device=dev)
+    torch.ops.bitsandbytes.dequantize_4bit.out(
+        A, AM, blocksize, quant_type, list(out_shape), dtype, out=out)
+    return out
+
+
 def make_quant_experts_cls(base_cls):
     """生成 drop-in 替换 Qwen3_5MoeExperts 的类（专家改成 per-expert nn.Linear）。"""
     from transformers.activations import ACT2FN
@@ -287,6 +339,8 @@ def make_quant_experts_cls(base_cls):
             self.act_fn = ACT2FN[config.hidden_act]
             # grouped 路径一旦抛异常就永久退回逐专家，避免每层重复炸。
             self._grouped_broken = False
+            # 批量反量化失败则永久退回逐专家反量化（仍保留 grouped 的 bmm）。
+            self._batched_dequant_broken = False
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
             # grouped 是**可选**路径：任何异常都退回逐专家，绝不让新路径静默出错。
@@ -382,17 +436,29 @@ def make_quant_experts_cls(base_cls):
                   .scatter(0, flat_idx, w)
                   .view(Eh, max_c))
 
-            # 命中专家的 int4 权重反量化进连续缓存（每个专家一次，不额外 stack）
-            qs0 = self.gate_up[hit_list[0]].weight.quant_state
-            dq_dtype = getattr(qs0, "dtype", torch.bfloat16)
-            Wg = torch.empty(Eh, 2 * I, H, dtype=dq_dtype, device=dev)
-            Wd = torch.empty(Eh, H, I, dtype=dq_dtype, device=dev)
+            # 命中专家的 int4 权重反量化。优先整层一次大 kernel（批量反量化），
+            # 失败则退回逐专家反量化（仍然保留 grouped 的 bmm），不让 GEMM 提速也丢掉。
+            gu_w = [self.gate_up[e].weight for e in hit_list]
+            dn_w = [self.down[e].weight for e in hit_list]
+            dq_dtype = getattr(gu_w[0].quant_state, "dtype", torch.bfloat16)
             with torch.no_grad():
-                for i, e in enumerate(hit_list):
-                    gw = self.gate_up[e].weight
-                    dw = self.down[e].weight
-                    dequantize_4bit(gw.data.view(-1, 1), gw.quant_state, out=Wg[i])
-                    dequantize_4bit(dw.data.view(-1, 1), dw.quant_state, out=Wd[i])
+                Wg = Wd = None
+                if not self._batched_dequant_broken:
+                    try:
+                        Wg = _dequant_experts_batched(gu_w, (Eh, 2 * I, H), dev)
+                        Wd = _dequant_experts_batched(dn_w, (Eh, H, I), dev)
+                    except Exception as exc:                   # noqa: BLE001
+                        self._batched_dequant_broken = True
+                        print(f"[moe] 批量反量化失败，退回逐专家反量化："
+                              f"{type(exc).__name__}: {exc}", flush=True)
+                if Wg is None:
+                    Wg = torch.empty(Eh, 2 * I, H, dtype=dq_dtype, device=dev)
+                    Wd = torch.empty(Eh, H, I, dtype=dq_dtype, device=dev)
+                    for i, (gwp, dwp) in enumerate(zip(gu_w, dn_w)):
+                        dequantize_4bit(gwp.data.view(-1, 1), gwp.quant_state,
+                                        out=Wg[i])
+                        dequantize_4bit(dwp.data.view(-1, 1), dwp.quant_state,
+                                        out=Wd[i])
 
             gu = torch.bmm(px.to(dq_dtype), Wg.transpose(1, 2))   # [Eh, max_c, 2I]
             gate, up = gu.chunk(2, dim=-1)
