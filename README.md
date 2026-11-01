@@ -41,11 +41,13 @@ memory, and the int4 base only takes 18.2 GiB.
 
 | setting | value | why |
 |---|---|---|
-| `--token-budget` | `2048` | caps padded `B*T`; the actual sample count varies |
-| `--batch` | `16` | hard cap on samples per step |
-| `--grad-ckpt` | `1` | activations ~12 GiB instead of ~40 GiB at B*T=2048 |
-| `--steps` | `46500` | fixed compute budget, not one epoch |
-| `--min-steps` | `20000` | keeps early stopping from firing at 4k steps |
+| `--token-budget` | `4096` | amortizes the fixed cost of MoE expert dispatch |
+| `--batch` | `32` | hard cap on samples per step |
+| `--grad-ckpt` | `1` | required at B*T=4096 on a 40GB A100 |
+| `--steps` | `23250` | roughly the previous total token budget |
+| `--min-steps` | `10000` | token-equivalent early-stop floor |
+| `--eval-every` / `--eval-n` | `1000` / `16` | lower evaluation overhead |
+| `--diag` | `0` | disable training-time diagnostics for throughput |
 
 Gradient checkpointing costs roughly 30% throughput and buys 2-4x the token
 budget. With a frozen base and LoRA/SOS adapters it must be paired with
@@ -63,21 +65,17 @@ torch, CUDA, and C++ ABI; this repository publishes the Colab/A100 build in the
 The trainer prints `[profile]` timings for its first
 three steps: batch/data, model+LM loss, auxiliary loss, backward, and optimizer.
 
-If `--token-budget 2048` still OOMs, drop to `1536` first; only fall back to
-`1024` if that fails too.
+If `--token-budget 4096` OOMs, use `--token-budget 3072 --batch 24` first.
 
-The full-run cell wraps the trainer in `timeout --signal=TERM`, so a 46500-step
+The full-run cell wraps the trainer in `timeout --signal=TERM`, so a 23250-step
 run is expected to span more than one Colab segment. Training resumes from the
 newest checkpoint each time; the step counter is restored, so `--min-steps`
 accumulates across segments. The dataset has 1,060,818 QA rows total
-(831,390 train / 66,796 val / 162,632 test), so 46,500 steps must not be
+(831,390 train / 66,796 val / 162,632 test), so 23,250 steps must not be
 described as one epoch. Sampling is without replacement inside each epoch.
 
-Measure the first few step timestamps before committing to the long run. One
-observed A100 40GB segment ran at about 29 s/step after model load: 46,500 steps
-would take about 15 days and roughly 50 Colab segments. 100 compute units are
-not enough for that schedule; use a shorter pilot, a persistent GPU, or a larger
-token budget only after checking VRAM headroom.
+The full-run cell prints per-step time, a three-step profile, and live GPU
+utilization. If reserved VRAM approaches 39 GiB, fall back to 3072/24.
 
 Checkpoint sync is optional. To persist training across Colab runtimes, create a
 fine-grained GitHub token with Contents read/write permission and add it to
