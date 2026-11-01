@@ -365,15 +365,21 @@ def make_quant_experts_cls(base_cls):
             self._batched_dequant_broken = False
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
-            # grouped 是**可选**路径：任何异常都退回逐专家，绝不让新路径静默出错。
+            # **不在 step 中途自动切换路径。** gradient checkpointing 的重算要求
+            # 原前向与重算走**完全相同的路径**，中途改路径会让保存/重算的张量数
+            # 或形状不一致，直接抛 CheckpointError（已实测：OOM 触发静默回退后，
+            # backward 重算报 metadata 不一致）。所以 grouped 出错时明确报错，
+            # 而不是静默换路径 —— 要回退请用 --experts per_expert 启动。
             if _EXPERTS_IMPL == "grouped" and not self._grouped_broken:
                 try:
                     return self._forward_grouped(
                         hidden_states, top_k_index, top_k_weights)
                 except Exception as exc:                       # noqa: BLE001
-                    self._grouped_broken = True
-                    print(f"[moe] grouped 路径失败，已退回逐专家："
-                          f"{type(exc).__name__}: {exc}", flush=True)
+                    raise RuntimeError(
+                        f"grouped 专家路径失败：{type(exc).__name__}: {exc}。"
+                        f"gradient checkpointing 下不能中途切换路径；"
+                        f"请降低 --token-budget/--batch，或改用 --experts per_expert。"
+                    ) from exc
             return self._forward_per_expert(
                 hidden_states, top_k_index, top_k_weights)
 
