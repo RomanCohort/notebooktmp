@@ -447,7 +447,8 @@ def make_quant_experts_cls(base_cls):
                 hit_map[hit] = torch.arange(Eh, device=dev)
                 ridx = hit_map[e_sorted]                       # [R] -> [0, Eh)
 
-            x = hidden_states[tok]                             # [R, H] 可微
+            # index_select 比高级索引 hidden_states[tok] 快，且同样可微。
+            x = hidden_states.index_select(0, tok)             # [R, H] 可微
             w = top_k_weights[tok, slot]                       # [R]   可微
             flat_idx = ridx * max_c + rank                     # [R]
             # scatter（非原地）建 padded 路由缓存：梯度经它回到 x / w
@@ -487,9 +488,11 @@ def make_quant_experts_cls(base_cls):
             act = self.act_fn(gate) * up
             down = torch.bmm(act, Wd.transpose(1, 2))             # [Eh, max_c, H]
             down = down * pw.unsqueeze(-1).to(down.dtype)
-            route_out = down.reshape(Eh * max_c, H).gather(
-                0, flat_idx.unsqueeze(1).expand(-1, H))
-            final.index_add_(0, tok, route_out.to(final.dtype))
+            # 直接对 padded 结果 index_add：把 token 下标 scatter 成 padded 布局，
+            # 省掉一次 [R, H] 的 gather-back 及其反向。padding 行 down=0，无害。
+            tok_padded = torch.zeros(Eh * max_c, dtype=torch.long, device=dev)
+            tok_padded.index_copy_(0, flat_idx, tok)
+            final.index_add_(0, tok_padded, down.reshape(Eh * max_c, H).to(final.dtype))
             return final
 
     Qwen3_5MoeExperts.__name__ = base_cls.__name__
