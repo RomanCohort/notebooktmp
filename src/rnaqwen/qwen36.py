@@ -290,28 +290,45 @@ def _dequant_experts_batched(weights, out_shape, dev):
     批量 A 的 shape[0] 是专家数，直接走 raw op 才不会被这条规则误伤（E == 1 时
     也不会把整块输出转置掉）。
     """
-    from bitsandbytes.functional import dequantize_blockwise
-
     qs0 = weights[0].quant_state
     blocksize = qs0.blocksize
     quant_type = qs0.quant_type
     dtype = qs0.dtype
-    packed, absmax = [], []
-    for w in weights:
-        qs = w.quant_state
-        packed.append(w.data.reshape(-1))
-        if qs.nested:
-            am = dequantize_blockwise(qs.absmax, qs.state2)
-            off = getattr(qs, "offset", None)
-            if off is not None:
-                am = am + off
-            am = am.float()
-        else:
-            am = qs.absmax.float()
-        absmax.append(am.reshape(-1))
 
-    A = torch.stack(packed)                      # [E, packed]
-    AM = torch.stack(absmax).reshape(-1)         # [E * num_blocks]
+    A = torch.stack([w.data.reshape(-1) for w in weights])    # [E, packed]
+    s2 = getattr(qs0, "state2", None)
+    if qs0.nested and s2 is not None:
+        # nested double-quant 的 absmax 还原也向量化：
+        #   eff_absmax = code[uint8_code] * state2.absmax[absmax_block] + offset
+        # 这正好是 dequantize_blockwise 的定义，但一次覆盖所有专家，替掉逐专家
+        # 512 次小 kernel（profiler 里这组调用 ~6 ms，且 CPU 侧间隙更大）。
+        try:
+            A8 = torch.stack([w.quant_state.absmax for w in weights]).long()   # [E, nb]
+            S = torch.stack([w.quant_state.state2.absmax for w in weights]).float()  # [E, nb2]
+            code = s2.code.float()
+            nb = A8.shape[1]
+            bidx = torch.arange(nb, device=A8.device) // int(s2.blocksize)
+            eff = code[A8] * S[:, bidx]                 # [E, nb]
+            off = getattr(qs0, "offset", None)
+            if off is not None:
+                eff = eff + off
+            AM = eff.reshape(-1)
+        except Exception:
+            # 退路：逐专家还原（与 bnb 逐位一致，慢但稳）
+            from bitsandbytes.functional import dequantize_blockwise
+            ams = []
+            for w in weights:
+                qs = w.quant_state
+                am = dequantize_blockwise(qs.absmax, qs.state2)
+                off = getattr(qs, "offset", None)
+                if off is not None:
+                    am = am + off
+                ams.append(am.float().reshape(-1))
+            AM = torch.stack(ams).reshape(-1)
+    else:
+        AM = torch.stack([w.quant_state.absmax.float().reshape(-1)
+                          for w in weights]).reshape(-1)
+
     out = torch.empty(out_shape, dtype=dtype, device=dev)
     torch.ops.bitsandbytes.dequantize_4bit.out(
         A, AM, blocksize, quant_type, list(out_shape), dtype, out=out)
