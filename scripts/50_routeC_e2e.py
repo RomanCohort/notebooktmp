@@ -1184,9 +1184,10 @@ def main() -> int:
         args.fingerprint["codes_index_sha256"] = sha256_file(Path(args.codes_idx))
         mmc = np.memmap(args.codes, dtype=np.uint16, mode="r",
                         shape=(n_pos,))
+        max_code = int(mmc.max())
         CODES = torch.from_numpy(mmc).clone()
-        if int(CODES.max()) >= VOCAB:
-            raise RuntimeError(f"码缓存最大 ID {int(CODES.max())} >= VOCAB {VOCAB}")
+        if max_code >= VOCAB:
+            raise RuntimeError(f"码缓存最大 ID {max_code} >= VOCAB {VOCAB}")
         CODE_IDX = {
             uid: ("codes", int(dc["offsets"][i]), int(dc["lens"][i]))
             for i, uid in enumerate(dc["uids"])
