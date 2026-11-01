@@ -43,7 +43,6 @@ memory, and the int4 base only takes 18.2 GiB.
 | `--grad-ckpt` | `1` | activations ~12 GiB instead of ~40 GiB at B*T=2048 |
 | `--steps` | `46500` | fixed compute budget, not one epoch |
 | `--min-steps` | `20000` | keeps early stopping from firing at 4k steps |
-| `--ablation-every` | `500` | vsperm/vszero/vsrandom/vsconst at every eval point |
 
 Gradient checkpointing costs roughly 30% throughput and buys 2-4x the token
 budget. With a frozen base and LoRA/SOS adapters it must be paired with

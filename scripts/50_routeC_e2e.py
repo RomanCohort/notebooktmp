@@ -77,7 +77,7 @@ def register_cache(key, x, lens, offsets, uids):
 def slice_hid(uid):
     ck, off, ln = IDX[uid]
     return HIDS[ck][off:off + ln].to(DEV, dtype=torch.float32)
-POOL = 4          # 由 --pool 覆盖；per_token_logp 也要用，所以放模块级
+POOL = 4          # 由 --pool 覆盖
 TAU = 4.0         # 软分配温度；0 时由 --tau 自动取 latent/2
 FSQ_CKPT = ROOT / "checkpoints/fsq_full/tokenizer.pt"
 
@@ -304,7 +304,7 @@ class E2EModel(nn.Module):
 
         老版本用 `v + head(q_ste)` 给 FSQ 传梯度 —— 那是一条**连续旁路**，
         梯度路径平滑，优化器会优先走它，硬查表退化成装饰。
-        后果：置换/随机/常数码三个消融全落回 50%，**这个配置不可证伪**。
+        后果：连续旁路会接管信息流，硬码表退化成装饰。
 
         修法：梯度走**软分配**，前向值仍是硬查表。
             v_hard = rna_emb[code]                      前向值
@@ -404,17 +404,14 @@ def answer_token_mask(tk, qa, lab):
 
     为什么必须单独标出来
     --------------------
-    `run_ablation` 的 `frac_neg` 原来把所有非 -100 的标签位置汇到一起。而
-    `build_batch` 的标签 span 是「no_think 的后 4 个 token + " A: 答案<eos>"」，
-    实测平均只有 **9.89 个 token**，其中：
+    `build_batch` 的标签 span 是「assistant 头 + no_think + " A: 答案<eos>"」。
+    固定样板会稀释答案 CE 和诊断信号，实测答案只占监督 token 的一小部分：
 
         no_think 尾巴（固定样板）  4     40.4%
         " A: " + eos（固定样板）  ~3.08  31.1%
         **答案**                 2.81   28.4%
 
-    样板与码无关、天然 50/50，会把 frac_neg 拖向 50% —— 于是
-    `50_` 里那条「零表/置换 < 45%」的判据在 seqtask 上永远通不过（假阴性）。
-    实测：vszero 52.7% / vsperm 46.4%，而稀释下限就有 35.8%。
+    样板与 RNA 无关，因此答案 CE 和诊断必须只统计答案正文。
 
     **用 offset mapping 精确定位，不靠长度相减。** BPE 在边界上会合并：
     `len(enc(" A: ")) + len(enc(ans))` 未必等于 `len(enc(" A: " + ans))`。
@@ -433,82 +430,6 @@ def answer_token_mask(tk, qa, lab):
         for i in hit:
             m[0, base + i] = True
     return m
-
-
-# ⚠️ 这个装饰器不能丢。丢了之后 model.rna_emb.weight.copy_(real_table) 会在
-#    需要梯度的 leaf 上原地操作，报 "a leaf Variable that requires grad is being
-#    used in an in-place operation" —— 而且**只在跑到消融那一步才炸**（训练正常），
-#    2026-10-13 就是这么死在 step 4500 的消融上的。
-#    起因是我用 `def per_token_logp(` 当锚点插新函数，把上面这行装饰器留给了新函数。
-@torch.no_grad()
-def per_token_logp(model, tk, examples, hid, perm=None, mode="real", max_n=25):
-    """返回 (全部有标签位置的 logp, 用的码 id 集合, **仅答案位置**的 logp)。
-
-    第三个返回值是后加的：判据要用答案那一小段，不能用整段标签 —— 见
-    `answer_token_mask` 的注释。返回值从 2 个变成 3 个，调用点只有 run_ablation。
-
-    perm != None 时：把码 c 换成 perm[c]（随机双射）。表、边缘分布、尺度全不变，
-    只切断「码 <-> 内容」的对应。这是本脚本最关键的仪器。
-    """
-    examples = spread(examples, max_n)
-    real_table = model.rna_emb.weight.detach().clone() if model.rna_emb is not None else None
-    if mode == "zero" and model.rna_emb is not None:
-        model.rna_emb.weight.zero_()
-    elif mode == "random" and model.rna_emb is not None:
-        g = torch.Generator(device="cpu").manual_seed(123)
-        model.rna_emb.weight.copy_(
-            torch.randn_like(real_table.cpu(), generator=g).to(real_table.device) * 0.02)
-    elif mode == "const" and model.rna_emb is not None:
-        model.rna_emb.weight.copy_(real_table[0].expand_as(real_table).clone())
-
-    out, out_ans, used = [], [], set()
-    for r, qa, clen, off in examples:
-        v, code, _, _ = vectors_for_uid(model, r["uid"], perm=perm, tau=TAU)
-        used |= set(code.tolist())
-        ids, lab, am = build_batch(tk, [(r, qa, clen, off)])
-        emask = answer_token_mask(tk, qa, lab)          # [1, T]
-        emb = model.embed(ids, v)
-        logits = model.llm(inputs_embeds=emb, attention_mask=am).logits.float()[:, :-1]
-        tgt = lab[:, 1:]
-        m = tgt >= 0
-        if m.sum():
-            lp = F.log_softmax(logits, -1).gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            out.extend(lp[m].tolist())
-            # emask 在 lab 的坐标上，lp 在 tgt 的坐标上（tgt[j] = lab[j+1]），所以错开一位
-            ma = emask[:, 1:] & m
-            out_ans.extend(lp[ma].tolist())
-    if model.rna_emb is not None:
-        model.rna_emb.weight.copy_(real_table)
-    return torch.tensor(out), used, torch.tensor(out_ans)
-
-
-def run_ablation(model, tk, ev_ex, hid, max_n=25):
-    """5 臂消融。每臂同时给**全部标签位置**和**只看答案位置**两套统计。
-
-    为什么要两套：全部标签位置被样板稀释（答案只占 28.4%），frac_neg 会被
-    样板噪声拖到接近 50%，45% 那条判据就失效。答案那一套才是判据该用的。
-    两套都留着，是为了能直接看出"稀释了多少"——单看一套会再次踩坑。
-    """
-    real, _, real_a = per_token_logp(model, tk, ev_ex, hid, max_n=max_n)
-    g = torch.Generator(device="cpu").manual_seed(2024)
-    perm = torch.randperm(VOCAB, generator=g).to(DEV)
-    res = {}
-    for name, kw in (("zero", dict(mode="zero")),
-                     ("random", dict(mode="random")),
-                     ("const", dict(mode="const")),
-                     ("perm", dict(perm=perm))):
-        a, _, a_a = per_token_logp(model, tk, ev_ex, hid, max_n=max_n, **kw)
-        n = min(len(real), len(a))
-        d = real[:n] - a[:n]
-        na = min(len(real_a), len(a_a))
-        da = real_a[:na] - a_a[:na]
-        res[name] = dict(
-            n=n, mean=float(d.mean()), frac_neg=float((d < 0).float().mean()),
-            n_ans=int(na),
-            mean_ans=float(da.mean()) if na else float("nan"),
-            frac_neg_ans=float((da < 0).float().mean()) if na else float("nan"),
-        )
-    return res
 
 
 # ---------------------------------------------------------------- 早停
@@ -561,7 +482,7 @@ def sample_batches(bucket_indices, eff_len, batch_size, token_budget, seed):
 
 
 @torch.no_grad()
-def val_ce(model, tk, ex_list, arm="A", max_n=25):
+def val_ce(model, tk, ex_list, max_n=25):
     """val 上答案 token 的**逐样本平均** CE，以及它的标准误。
 
     返回 (mean, se)。
@@ -574,15 +495,11 @@ def val_ce(model, tk, ex_list, arm="A", max_n=25):
     而 min_delta=0.005 在 CE≈1.0 上要求分辨 0.005 —— **信噪比差 40 倍**。
     所以判据里必须有 se 这一项（见下面的调用处）。
 
-    arm A = 真实 RNA 码向量；arm C = 码向量置零。
-    两个都要看：单看 CE_A 会被"模型学会了问题的先验"骗过去，
-    C 臂把先验单独量出来，健康信号是 gap = CE_C - CE_A 在扩大。
+    只评估真实 RNA 码向量。
     """
     per_ex = []
     for r, qa, clen, off in spread(ex_list, max_n):
         v, _, _, _ = vectors_for_uid(model, r.get("uid"), tau=TAU)
-        if arm == "C":
-            v = torch.zeros_like(v)
         ids, lab, am = build_batch(tk, [(r, qa, clen, off)])
         emb = model.embed(ids, v)
         lg = model.llm(inputs_embeds=emb, attention_mask=am).logits.float()[:, :-1]
@@ -1100,9 +1017,6 @@ def main() -> int:
     ap.add_argument("--patience", type=int, default=6, help="连续多少个 eval 点无改善就停")
     ap.add_argument("--min-steps", type=int, default=4000,
                     help="早停生效前至少训这么多步（防早期噪声）")
-    ap.add_argument("--ablation-every", type=int, default=-1,
-                    help="每隔多少步跑一次 5 臂消融。-1 = 跟 eval-every 同步（旧行为）；"
-                         "0 = 训练中不跑，只在最后跑。35B 上 5 臂 x eval-n 次前向很贵")
     ap.add_argument("--trim-every", type=int, default=100,
                     help="每多少步修剪一次工作集。**用 mmap 副缓存时必须 > 0**："
                          "slice_hid 会把 memmap 的页 fault 进工作集，"
@@ -1339,7 +1253,7 @@ def main() -> int:
                      sos_dropout=args.sos_dropout)
     # Tok.base_vocab 来自 tokenizer.vocab_size，模型的来自 embedding 行数。二者若不相等，
     # build_batch 写进去的占位 id 会小于模型的 base_vocab -> is_rna 恒 False ->
-    # RNA 段原样当成普通 token，四次消融结果完全相同。必须先对齐。
+    # RNA 段会被原样当成普通 token，替换路径失效。必须先对齐。
     print(f"[vocab] tokenizer {tk.base_vocab}   embedding {model.base_vocab}")
     if tk.base_vocab != model.base_vocab:
         print(f"[vocab] **不一致**，以 embedding 的 {model.base_vocab} 为准")
@@ -1507,7 +1421,6 @@ def main() -> int:
     # ---- 早停状态 ----
     best_ce = float("inf")
     best_step = -1
-    best_gap = float("nan")
     patience_left = args.patience
     stop_reason = ""
     stopped_early = False
@@ -1519,12 +1432,12 @@ def main() -> int:
             e = rec.get("early")
             if e and e.get("metric") == EARLY_METRIC:
                 if e.get("ce_a", float("inf")) < best_ce:
-                    best_ce, best_step, best_gap = e["ce_a"], rec["step"], e["gap"]
+                    best_ce, best_step = e["ce_a"], rec["step"]
                 if "patience_left" in e:
                     patience_left = e["patience_left"]
         if best_step > 0 and not (ckdir / "best.pt").is_file():
             print("[早停] 历史记录有 best 但 best.pt 不存在；本轮重新建立 best")
-            best_ce, best_step, best_gap = float("inf"), -1, float("nan")
+            best_ce, best_step = float("inf"), -1
             patience_left = args.patience
         if best_step > 0:
             print(f"[早停] 从历史恢复：最优 CE_A {best_ce:.4f} @ step {best_step}  "
@@ -1738,32 +1651,6 @@ def main() -> int:
 
         if args.eval_every and step % args.eval_every == 0:
             model.eval()
-            # 5 臂消融在 35B 上一次 = 5 x eval-n 次前向，很贵；用 --ablation-every 0 关掉它，
-            # 训练中只用便宜的 A/C 两臂 CE 监视（见下面的早停块）。
-            if args.ablation_every < 0:
-                do_ab = True                       # -1：跟 eval-every 同步（旧行为）
-            elif args.ablation_every == 0:
-                do_ab = False                      # 0：训练中不跑
-            else:
-                do_ab = (step % args.ablation_every == 0)
-            ab = (run_ablation(model, tk, ev_ex, hid, max_n=args.eval_n)
-                  if do_ab else None)
-            if ab is not None:
-                print(f"  [eval@{step}] 全部标签 n={ab['zero']['n']}  " + "  ".join(
-                    f"vs{k} {100*v['frac_neg']:.1f}%(m{v['mean']:+.3f})"
-                    for k, v in ab.items()), flush=True)
-                # **只看答案 token 的那一套才是判据。** 全部标签那一套被样板稀释
-                # （答案只占 28.4%），frac_neg 天然被拖到 ~44% 以上，45% 那条线永远通不过。
-                print(f"  [eval@{step}] 只看答案 n={ab['zero']['n_ans']}  " + "  ".join(
-                    f"vs{k} {100*v['frac_neg_ans']:.1f}%(m{v['mean_ans']:+.3f})"
-                    for k, v in ab.items()), flush=True)
-                # 仪器灵敏度：若 |Δ| 中位数 ~1e-3，说明消融几乎没改变任何东西，
-                # 这时 frac_neg 就是噪声，不能拿它下任何结论。
-                mags = [abs(v["mean_ans"]) for v in ab.values()]
-                print(f"           |Δ| 均值（答案）{max(mags):.4f}  "
-                      f"{'<- 太小，frac_neg 无意义' if max(mags) < 0.02 else ''}",
-                      flush=True)
-                log.append(dict(step=step, ablation=ab))
             if args.diag:
                 dg = diagnose(model, tk, ev_ex, max_n=args.diag_n)
                 if dg:
@@ -1772,9 +1659,7 @@ def main() -> int:
 
             # ---- 早停：只算 CE，不生成 ----
             if args.early_stop:
-                ce_a, se_a = val_ce(model, tk, ev_ex, arm="A", max_n=args.eval_n)
-                ce_c, _ = val_ce(model, tk, ev_ex, arm="C", max_n=args.eval_n)
-                gap = ce_c - ce_a
+                ce_a, se_a = val_ce(model, tk, ev_ex, max_n=args.eval_n)
                 # 判据的**有效阈值**：既要超过相对改善 min_delta，
                 # 也要超过一个标准误。少了 se 这一项，patience 会被噪声吃光。
                 if best_ce == float("inf"):
@@ -1783,23 +1668,22 @@ def main() -> int:
                     need = max(args.min_delta * abs(best_ce), se_a)
                 improved = best_ce == float("inf") or ce_a < best_ce - need
                 if improved:
-                    best_ce, best_step, best_gap = ce_a, step, gap
+                    best_ce, best_step = ce_a, step
                     patience_left = args.patience
                 elif step >= args.min_steps:
                     patience_left -= 1
 
-                ce_hist.append(dict(step=step, ce_a=ce_a, se_a=se_a, ce_c=ce_c,
-                                    gap=gap, best=best_ce))
+                ce_hist.append(dict(step=step, ce_a=ce_a, se_a=se_a, best=best_ce))
                 # 先更新 state 再落 log；best.pt 里的 log 才会恢复正确 patience。
                 log.append(dict(step=step, early=dict(
                     metric=EARLY_METRIC,
-                    ce_a=ce_a, se_a=se_a, ce_c=ce_c, gap=gap, best=best_ce,
+                    ce_a=ce_a, se_a=se_a, best=best_ce,
                     patience_left=patience_left)))
                 if improved:
                     bp = ckdir / "best.pt"
                     save_ckpt(bp, step, model, opt, log, args, time.time() - t0)
-                print(f"  [早停@{step}] CE_A {ce_a:.4f}±{se_a:.4f}  CE_C {ce_c:.4f}  "
-                      f"gap {gap:+.4f}   最优 {best_ce:.4f}@{best_step}  "
+                print(f"  [早停@{step}] CE_A {ce_a:.4f}±{se_a:.4f}  "
+                      f"最优 {best_ce:.4f}@{best_step}  "
                       f"需改善 {need:.4f}  耐心 {patience_left}/{args.patience}",
                       flush=True)
                 if improved:
@@ -1812,7 +1696,7 @@ def main() -> int:
                                    f"改善 < max({args.min_delta:.1%}×CE, 1 se)"
                                    f"={need:.4f}")
                     print(f"  ** 早停触发：{stop_reason}  "
-                          f"最优 {best_ce:.4f}@{best_step}（gap {best_gap:+.4f}）**",
+                          f"最优 {best_ce:.4f}@{best_step}**",
                           flush=True)
                     break
             model.train()
@@ -1840,55 +1724,15 @@ def main() -> int:
           f"{fp.stat().st_size/1024/1024:.1f} MB)", flush=True)
 
     if args.early_stop:
-        print(f"\n[早停汇总] 最优 CE_A {best_ce:.4f} @ step {best_step}"
-              f"（gap {best_gap:+.4f}）")
+        print(f"\n[早停汇总] 最优 CE_A {best_ce:.4f} @ step {best_step}")
         print(f"           停止原因：{stop_reason or '未触发（跑满步数）'}")
         print(f"           {'有' if (ckdir/'best.pt').exists() else '没有'} best.pt")
         for h in ce_hist:
             print(f"   step {h['step']:>6}  CE_A {h['ce_a']:.4f}  "
-                  f"CE_C {h['ce_c']:.4f}  gap {h['gap']:+.4f}")
-
-    print("\n=== 最终消融 ===")
-    model.eval()
-    ab = run_ablation(model, tk, te_ex or ev_ex, hid, max_n=40)
-    for k, v in ab.items():
-        print(f"  vs {k:7}  全部标签 n {v['n']:>5}  Δlogp 均值 {v['mean']:+.4f}  "
-              f"负值 {100*v['frac_neg']:.1f}%")
-        print(f"             **只看答案** n {v['n_ans']:>5}  Δlogp 均值 {v['mean_ans']:+.4f}  "
-              f"负值 {100*v['frac_neg_ans']:.1f}%")
-    print()
-    print("  怎么读（关键在对照，不在第一个数）:")
-    print("    vs 零表  低 => RNA 位置上「有东西」在起作用")
-    print("    vs 随机表 低 => 换掉整张表会变差")
-    print("    vs 常数码 低 => 码的区分度在起作用")
-    print("    ** vs 置换 低 => 码与内容的对应在起作用（最干净的那个）**")
-    print()
-    print("  ⚠️ 判据用「只看答案」那一套。全部标签那一套被样板稀释：")
-    print("     标签 span 平均 9.89 个 token，其中答案只占 2.81（28.4%），")
-    print("     其余是 no_think 尾巴 + ' A: ' + eos，与码无关、天然 50/50。")
-    print("     稀释下限就有 ~36%，所以「全部标签」永远通不过 45% 的线。")
-    print()
-    pk = ab["perm"]["frac_neg_ans"]
-    zk = ab["zero"]["frac_neg_ans"]
-    if zk < 0.45 and pk < 0.45:
-        print(f"  ✅ **码真的被读了。** 答案 token 上：零表 {100*zk:.1f}%、"
-              f"置换 {100*pk:.1f}% 都低于 45%。可上全量。")
-    elif zk < 0.45:
-        print(f"  ❌ **模型只用了「RNA 位置有个向量」，没用码的身份。**")
-        print(f"     答案 token 上零表 {100*zk:.1f}% 说明有东西在用；"
-              f"但置换 {100*pk:.1f}% 说明把码打乱不影响结果。")
-        print("     => 码的切分方式对 LLM 无意义，要改的是 tokenizer 的目标，不是加步数。")
-    else:
-        hint = "--codes 路径看码表漂移/梯度" if args.codes else "看 |grad_fsq|"
-        print(f"  ❌ 连「有东西」都不起作用（答案 token 上零表 {100*zk:.1f}%）。"
-              f"先查梯度是否回传（{hint}）。")
-    print()
-    print("  注意：Δlogp 的**均值**是另一个独立证据，它不被稀释。若均值上")
-    print("       零表 < 置换 ≈ 常数码，说明「错误但看似合理的码」比「没有码」更有害")
-    print("       —— 那是码身份在起作用的强证据（存在感假设会给出相反的排序）。")
+                  f"SE {h['se_a']:.4f}")
 
     (outdir / "summary.json").write_text(json.dumps(
-        dict(args=vars(args), end_step=end_step, log=log, final=ab),
+        dict(args=vars(args), end_step=end_step, log=log),
         ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 交付产物：adapter / FSQ / 码表 分开存，推理时都要用
