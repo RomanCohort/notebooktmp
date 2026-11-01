@@ -172,7 +172,7 @@ set +e
   --steps "$STEPS" --min-steps "$MIN_STEPS" \
   --early-stop 1 --eval-every "$EVAL_EVERY" --patience "$PATIENCE" \
   --save-every "$SAVE_EVERY" --save-minutes "$SAVE_MINUTES" \
-  --keep-ckpt "$KEEP_CKPT" --ablation-every -1 \
+  --keep-ckpt "$KEEP_CKPT" --grad-ckpt 1 --experts grouped \
   --tag "$TAG" "${resume_args[@]}" \
   2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}

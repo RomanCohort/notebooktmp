@@ -50,6 +50,29 @@ memory, and the int4 base only takes 18.2 GiB.
 | `--eval-every` / `--eval-n` | `500` / `16` | matches the previous token interval |
 | `--diag` | `0` | disable training-time diagnostics for throughput |
 
+## MoE expert execution
+
+The 35B base has 256 experts per MoE layer and two int4 linears per expert.
+Running them as a per-expert loop launches hundreds of tiny `Linear4bit` kernels
+per layer — each dequantizes a small weight and then does a small GEMM — so the
+GPU spends most of its time waiting between launches instead of computing.
+
+Training now uses `--experts grouped` by default. It sorts routes by expert,
+dequantizes the hit experts' int4 weights into one contiguous buffer, and runs
+two `bmm` ops per layer instead of the per-expert loop. The base weights stay
+frozen; autograd propagates only to `hidden_states`. On an A100 40GB, one
+real-shape layer (256 experts, hidden 2048, intermediate 512, 8192 tokens, top-8)
+measured **4.99x** faster forward+backward than the per-expert path, with
+`max|Δforward| ≈ 3.9e-3` in bf16 and peak layer VRAM rising from ~1.2 to ~3.6
+GiB (transient, under `--grad-ckpt 1`).
+
+`torch._grouped_mm` is not used: on torch 2.11.0+cu130 its backward raises
+`Invalid strides/sizes`, and bnb's `matmul_4bit` requires a 2D `quant_state`, so
+NV4 experts cannot be batched through either directly. If `grouped` raises for
+any reason the trainer logs it and falls back to the per-expert path for the rest
+of the run — it never silently returns wrong numbers. `scripts/_test_grouped_experts.py`
+compares both paths' forward output and dL/dx on GPU.
+
 Gradient checkpointing costs throughput and buys 2-4x the activation budget.
 With a frozen base and LoRA/SOS adapters it must be paired with
 `enable_input_require_grads()`, otherwise gradients stop at `inputs_embeds`.

@@ -994,10 +994,11 @@ def main() -> int:
     ap.add_argument("--qwen36-mode", choices=["int4", "int8"], default="int4",
                     help="Qwen3.6 专家的量化位数。int8 显存 34.7 GiB，int4 18.3 GiB")
     ap.add_argument("--experts", choices=["per_expert", "grouped"],
-                    default="per_expert",
-                    help="MoE 专家执行路径。per_expert = 原来逐专家 Linear4bit；"
-                         "grouped = 命中专家权重批量反量化 + bmm（实验性提速，"
-                         "异常自动退回 per_expert）")
+                    default="grouped",
+                    help="MoE 专家执行路径。grouped（默认）= 命中专家权重批量反量化"
+                         " + 两次 bmm，把每层数百次小 GPU 调用压成批量 GEMM；"
+                         "per_expert = 原来的逐专家 Linear4bit 循环。"
+                         "grouped 抛异常时自动退回 per_expert，不会静默出错。")
     ap.add_argument("--lora-preset", default="C",
                     help="Qwen3.6 的 LoRA target 预设 A/B/C/D（见 rnaqwen.qwen36），"
                          "或逗号分隔的模块名。C = 190 模块 / 8.13 M")
