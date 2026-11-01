@@ -34,7 +34,9 @@ class _Base:
 
 def build(dev: str):
     cls = make_quant_experts_cls(_Base)
-    m = cls(_Cfg()).to(dev)
+    # 真实装载路径里专家权重来自 safetensors（bf16），这里先转 bf16 再量化，
+    # 让 quant_state.dtype 与真实路径一致，比较才有意义。
+    m = cls(_Cfg()).to(dev).to(torch.bfloat16)
     for e in range(m.num_experts):
         m.gate_up[e] = to_bnb_linear(m.gate_up[e], "int4").to(dev)
         m.down[e] = to_bnb_linear(m.down[e], "int4").to(dev)
