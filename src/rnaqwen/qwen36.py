@@ -309,9 +309,14 @@ def _dequant_experts_batched(weights, out_shape, dev):
             nb = A8.shape[1]
             bidx = torch.arange(nb, device=A8.device) // int(s2.blocksize)
             eff = code[A8] * S[:, bidx]                 # [E, nb]
-            off = getattr(qs0, "offset", None)
-            if off is not None:
-                eff = eff + off
+            # 每个专家的 offset 是各自不同的标量，必须按专家广播 —— 用 qs0 的
+            # offset 套给所有专家会引入 ~1 个 bf16 ULP 的误差（8.13M 参数里查过）。
+            offs = [getattr(w.quant_state, "offset", None) for w in weights]
+            if any(o is not None for o in offs):
+                zero = torch.zeros((), device=eff.device, dtype=eff.dtype)
+                O = torch.stack([o.float().reshape(()) if o is not None else zero
+                                 for o in offs])
+                eff = eff + O[:, None]
             AM = eff.reshape(-1)
         except Exception:
             # 退路：逐专家还原（与 bnb 逐位一致，慢但稳）
