@@ -340,6 +340,165 @@ def _dequant_experts_batched(weights, out_shape, dev):
     return out
 
 
+def _grouped_chunk_rows(experts, x_rows, w_rows, hit_ids, counts_c, max_cc):
+    """一个专家块的前向：批量反量化 + 两次 bmm，返回按路由顺序的 [n_c, H]。
+
+    forward（no_grad）和 backward 重算（enable_grad）共用这一段，保证两条
+    路径走完全相同的算子序列 —— 这对 gradient checkpointing 的重算一致性
+    是硬要求（重算必须逐位复现前向保存的张量形状）。
+    """
+    from bitsandbytes.functional import dequantize_4bit
+
+    c = len(counts_c)
+    H = experts.hidden_dim
+    I = experts.intermediate_dim
+    dev = x_rows.device
+    lc = torch.tensor(counts_c, device=dev)
+    local_eidx = torch.repeat_interleave(torch.arange(c, device=dev), lc)
+    offs = torch.cumsum(lc, 0) - lc
+    rank = (torch.arange(x_rows.shape[0], device=dev)
+            - torch.repeat_interleave(offs, lc))
+    flat = local_eidx * max_cc + rank
+    px = (torch.zeros(c * max_cc, H, dtype=x_rows.dtype, device=dev)
+          .scatter(0, flat.unsqueeze(1).expand(-1, H), x_rows)
+          .view(c, max_cc, H))
+    pw = (torch.zeros(c * max_cc, dtype=w_rows.dtype, device=dev)
+          .scatter(0, flat, w_rows)
+          .view(c, max_cc))
+
+    gu_w = [experts.gate_up[e].weight for e in hit_ids]
+    dn_w = [experts.down[e].weight for e in hit_ids]
+    dq_dtype = getattr(gu_w[0].quant_state, "dtype", torch.bfloat16)
+    Wg = Wd = None
+    if not experts._batched_dequant_broken:
+        try:
+            with torch.no_grad():
+                Wg = _dequant_experts_batched(gu_w, (c, 2 * I, H), dev)
+                Wd = _dequant_experts_batched(dn_w, (c, H, I), dev)
+        except Exception as exc:                           # noqa: BLE001
+            experts._batched_dequant_broken = True
+            print(f"[moe] 批量反量化失败，退回逐专家反量化："
+                  f"{type(exc).__name__}: {exc}", flush=True)
+    if Wg is None:
+        Wg = torch.empty(c, 2 * I, H, dtype=dq_dtype, device=dev)
+        Wd = torch.empty(c, H, I, dtype=dq_dtype, device=dev)
+        with torch.no_grad():
+            for i, (gwp, dwp) in enumerate(zip(gu_w, dn_w)):
+                dequantize_4bit(gwp.data.view(-1, 1), gwp.quant_state, out=Wg[i])
+                dequantize_4bit(dwp.data.view(-1, 1), dwp.quant_state, out=Wd[i])
+
+    gu = torch.bmm(px.to(dq_dtype), Wg.transpose(1, 2))   # [c, max_cc, 2I]
+    gate, up = gu.chunk(2, dim=-1)
+    act = experts.act_fn(gate) * up
+    dn = torch.bmm(act, Wd.transpose(1, 2))               # [c, max_cc, H]
+    dn = dn * pw.unsqueeze(-1).to(dn.dtype)
+    return dn.reshape(c * max_cc, H).gather(0, flat.unsqueeze(1).expand(-1, H))
+
+
+class _GroupedMoEFn(torch.autograd.Function):
+    """grouped MoE 的自定义 autograd：forward 不存 MoE 图，backward 逐块重算。
+
+    为什么要自己写 backward（而不是让 autograd 存图）：
+    整层 256 专家的 padded 激活 + 反量化权重同时挂在图上，A100 40GB 上
+    batch64/token-budget8192 实测 OOM（allocated 32.4 GiB 时再要 528 MiB 失败）。
+    这里 forward 全程 no_grad（不保存任何 MoE 中间量），backward 按**同一块
+    边界**逐块重算、拿到梯度立刻 index_add 进累积梯度并释放该块 —— 任一时刻
+    只有 1 个块的临时显存（约 1 GiB），而不是整层（约 12 GiB）。
+
+    重算的数值与 forward 完全一致（同一个 _grouped_chunk_rows、同一块边界），
+    所以与 gradient checkpointing 兼容：checkpoint 重算整层时再次走 forward，
+    结果逐位相同。
+    """
+
+    CHUNK = 32
+
+    @staticmethod
+    def forward(ctx, hidden_states, top_k_weights, top_k_index, experts):
+        E = experts.num_experts
+        K = top_k_index.size(-1)
+        dev = hidden_states.device
+        final = torch.zeros_like(hidden_states)
+
+        with torch.no_grad():
+            eid = top_k_index.reshape(-1)                  # [R]
+            R = eid.numel()
+            slot_all = torch.arange(R, device=dev) % K
+            order = torch.argsort(eid * K + slot_all, stable=True)
+            counts = torch.bincount(eid, minlength=E)
+            tok = torch.div(order, K, rounding_mode="floor")
+            slot = order - tok * K
+            hit = torch.nonzero(counts, as_tuple=False).flatten()
+            hit_counts = counts[hit]
+            hit_start = torch.cumsum(hit_counts, 0) - hit_counts
+            hit_list = hit.tolist()                        # 一次同步
+            counts_l = hit_counts.tolist()
+            starts_l = hit_start.tolist()
+
+        ctx.experts = experts
+        ctx.K = K
+        ctx.tok = tok
+        ctx.slot = slot
+        ctx.hit_list = hit_list
+        ctx.counts_l = counts_l
+        ctx.starts_l = starts_l
+        ctx.save_for_backward(hidden_states, top_k_weights)
+
+        for i0 in range(0, len(hit_list), _GroupedMoEFn.CHUNK):
+            i1 = min(i0 + _GroupedMoEFn.CHUNK, len(hit_list))
+            counts_c = counts_l[i0:i1]
+            rs = starts_l[i0]
+            re = starts_l[i1 - 1] + counts_c[-1]
+            if rs == re:
+                continue
+            max_cc = max(counts_c)
+            tok_c = tok[rs:re]
+            slot_c = slot[rs:re]
+            x_c = hidden_states.index_select(0, tok_c)
+            w_c = top_k_weights[tok_c, slot_c]
+            route_out = _grouped_chunk_rows(
+                experts, x_c, w_c, hit_list[i0:i1], counts_c, max_cc)
+            final.index_add_(0, tok_c, route_out.to(final.dtype))
+        return final
+
+    @staticmethod
+    def backward(ctx, grad_final):
+        hidden_states, top_k_weights = ctx.saved_tensors
+        experts = ctx.experts
+        K = ctx.K
+        tok, slot = ctx.tok, ctx.slot
+        hit_list, counts_l, starts_l = ctx.hit_list, ctx.counts_l, ctx.starts_l
+        need_w = ctx.needs_input_grad[1]
+        grad_h = torch.zeros_like(hidden_states)
+        grad_w = torch.zeros_like(top_k_weights) if need_w else None
+
+        for i0 in range(0, len(hit_list), _GroupedMoEFn.CHUNK):
+            i1 = min(i0 + _GroupedMoEFn.CHUNK, len(hit_list))
+            counts_c = counts_l[i0:i1]
+            rs = starts_l[i0]
+            re = starts_l[i1 - 1] + counts_c[-1]
+            if rs == re:
+                continue
+            max_cc = max(counts_c)
+            tok_c = tok[rs:re]
+            slot_c = slot[rs:re]
+            g_c = grad_final.index_select(0, tok_c).contiguous()
+            with torch.enable_grad():
+                x_c = hidden_states.index_select(0, tok_c).detach()
+                x_c.requires_grad_(True)
+                w_c = top_k_weights[tok_c, slot_c].detach()
+                if need_w:
+                    w_c.requires_grad_(True)
+                route_out = _grouped_chunk_rows(
+                    experts, x_c, w_c, hit_list[i0:i1], counts_c, max_cc)
+                ins = [x_c] + ([w_c] if need_w else [])
+                grads = torch.autograd.grad(route_out, ins, g_c)
+            grad_h.index_add_(0, tok_c, grads[0].to(grad_h.dtype))
+            if need_w:
+                grad_w.view(-1).index_add_(
+                    0, tok_c * K + slot_c, grads[1].to(grad_w.dtype))
+        return grad_h, grad_w, None, None
+
+
 def make_quant_experts_cls(base_cls):
     """生成 drop-in 替换 Qwen3_5MoeExperts 的类（专家改成 per-expert nn.Linear）。"""
     from transformers.activations import ACT2FN
@@ -372,8 +531,8 @@ def make_quant_experts_cls(base_cls):
             # 而不是静默换路径 —— 要回退请用 --experts per_expert 启动。
             if _EXPERTS_IMPL == "grouped" and not self._grouped_broken:
                 try:
-                    return self._forward_grouped(
-                        hidden_states, top_k_index, top_k_weights)
+                    return _GroupedMoEFn.apply(
+                        hidden_states, top_k_weights, top_k_index, self)
                 except Exception as exc:                       # noqa: BLE001
                     raise RuntimeError(
                         f"grouped 专家路径失败：{type(exc).__name__}: {exc}。"
@@ -414,46 +573,6 @@ def make_quant_experts_cls(base_cls):
                     0, token_idx, cur.to(final_hidden_states.dtype))
             return final_hidden_states
 
-        def _forward_grouped(self, hidden_states, top_k_index, top_k_weights):
-            """grouped expert execution：按专家分块，批量反量化 + bmm。
-
-            内存是第一约束：整层 256 专家的 bf16 权重约 2.1 GiB（gate_up + down），
-            再加 [E_hit, max_c, H] 的 padded 激活，A100 40GB 上 batch64 /
-            token-budget8192 会 OOM。所以按 CHUNK 个专家一块处理：每块只反量化
-            这一块的权重、只建这一块的 padded 缓冲，bmm 后立刻 index_add 回
-            final，峰值临时显存从 ~3.6 GiB 降到 ~0.5 GiB。
-
-            每块内部与整层版数学完全一致：路由按 (expert, slot, token) 排序后，
-            同一块覆盖的专家对应的路由是**连续**的一段，按路由切片即可。权重冻结，
-            autograd 只回传到 hidden_states。
-            """
-            from bitsandbytes.functional import dequantize_4bit
-
-            E = self.num_experts
-            H = self.hidden_dim
-            I = self.intermediate_dim
-            K = top_k_index.size(-1)
-            dev = hidden_states.device
-            final = torch.zeros_like(hidden_states)
-            CHUNK = 32
-
-            with torch.no_grad():
-                eid = top_k_index.reshape(-1)                  # [R] 每条路由的专家 id
-                R = eid.numel()
-                slot_all = torch.arange(R, device=dev) % K
-                order = torch.argsort(eid * K + slot_all, stable=True)
-                counts = torch.bincount(eid, minlength=E)      # [E]
-                tok = torch.div(order, K, rounding_mode="floor")   # [R] token 下标
-                slot = order - tok * K                              # [R] top-k 槽位
-                hit = torch.nonzero(counts, as_tuple=False).flatten()
-                hit_counts = counts[hit]                        # [Eh]
-                hit_route_start = torch.cumsum(hit_counts, 0) - hit_counts  # [Eh]
-                hit_list = hit.tolist()                        # 一次同步
-                hit_counts_l = hit_counts.tolist()
-                hit_start_l = hit_route_start.tolist()
-                Eh = len(hit_list)
-            if Eh == 0:
-                return final
 
             dq_dtype = getattr(self.gate_up[hit_list[0]].weight.quant_state,
                                "dtype", torch.bfloat16)
