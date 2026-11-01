@@ -409,13 +409,17 @@ def make_quant_experts_cls(base_cls):
             return final_hidden_states
 
         def _forward_grouped(self, hidden_states, top_k_index, top_k_weights):
-            """grouped expert execution：命中专家权重批量反量化 + bmm。
+            """grouped expert execution：按专家分块，批量反量化 + bmm。
 
-            按 (expert, slot, token) 排序后，每个专家是一段连续路由。把命中
-            专家的 int4 权重反量化进 [E_hit, out, in] 的缓存，路由 token 按
-            (expert, 段内序号) 散射进 [E_hit, max_c, H]，然后用两次 bmm 做
-            整层的专家门控/下投影。权重是常量（冻结），autograd 只把梯度回传
-            给 hidden_states —— 满足「backward 支持输入梯度、基座 frozen」。
+            内存是第一约束：整层 256 专家的 bf16 权重约 2.1 GiB（gate_up + down），
+            再加 [E_hit, max_c, H] 的 padded 激活，A100 40GB 上 batch64 /
+            token-budget8192 会 OOM。所以按 CHUNK 个专家一块处理：每块只反量化
+            这一块的权重、只建这一块的 padded 缓冲，bmm 后立刻 index_add 回
+            final，峰值临时显存从 ~3.6 GiB 降到 ~0.5 GiB。
+
+            每块内部与整层版数学完全一致：路由按 (expert, slot, token) 排序后，
+            同一块覆盖的专家对应的路由是**连续**的一段，按路由切片即可。权重冻结，
+            autograd 只回传到 hidden_states。
             """
             from bitsandbytes.functional import dequantize_4bit
 
@@ -425,6 +429,7 @@ def make_quant_experts_cls(base_cls):
             K = top_k_index.size(-1)
             dev = hidden_states.device
             final = torch.zeros_like(hidden_states)
+            CHUNK = 32
 
             with torch.no_grad():
                 eid = top_k_index.reshape(-1)                  # [R] 每条路由的专家 id
@@ -434,62 +439,75 @@ def make_quant_experts_cls(base_cls):
                 counts = torch.bincount(eid, minlength=E)      # [E]
                 tok = torch.div(order, K, rounding_mode="floor")   # [R] token 下标
                 slot = order - tok * K                              # [R] top-k 槽位
-                e_sorted = eid[order]                              # [R] 已按专家排序
-                starts = torch.cumsum(counts, 0) - counts          # [E]
-                rank = torch.arange(R, device=dev) - starts[e_sorted]  # 段内序号
                 hit = torch.nonzero(counts, as_tuple=False).flatten()
+                hit_counts = counts[hit]                        # [Eh]
+                hit_route_start = torch.cumsum(hit_counts, 0) - hit_counts  # [Eh]
                 hit_list = hit.tolist()                        # 一次同步
+                hit_counts_l = hit_counts.tolist()
+                hit_start_l = hit_route_start.tolist()
                 Eh = len(hit_list)
-                if Eh == 0:
-                    return final
-                max_c = int(counts[hit].max().item())          # 每层一次同步
-                hit_map = torch.empty(E, dtype=torch.long, device=dev)
-                hit_map[hit] = torch.arange(Eh, device=dev)
-                ridx = hit_map[e_sorted]                       # [R] -> [0, Eh)
+            if Eh == 0:
+                return final
 
-            x = hidden_states[tok]                             # [R, H] 可微
-            w = top_k_weights[tok, slot]                       # [R]   可微
-            flat_idx = ridx * max_c + rank                     # [R]
-            # scatter（非原地）建 padded 路由缓存：梯度经它回到 x / w
-            px = (torch.zeros(Eh * max_c, H, dtype=hidden_states.dtype, device=dev)
-                  .scatter(0, flat_idx.unsqueeze(1).expand(-1, H), x)
-                  .view(Eh, max_c, H))
-            pw = (torch.zeros(Eh * max_c, dtype=w.dtype, device=dev)
-                  .scatter(0, flat_idx, w)
-                  .view(Eh, max_c))
+            dq_dtype = getattr(self.gate_up[hit_list[0]].weight.quant_state,
+                               "dtype", torch.bfloat16)
+            for i0 in range(0, Eh, CHUNK):
+                i1 = min(i0 + CHUNK, Eh)
+                c = i1 - i0
+                counts_c = hit_counts_l[i0:i1]
+                rs = hit_start_l[i0]
+                re = hit_start_l[i1 - 1] + counts_c[-1]
+                if rs == re:
+                    continue
+                max_cc = max(counts_c)
+                tok_c = tok[rs:re]                              # [n_c] token 下标
+                slot_c = slot[rs:re]
+                w_c = top_k_weights[tok_c, slot_c]              # [n_c] 可微
+                lc = torch.tensor(counts_c, device=dev)
+                local_eidx = torch.repeat_interleave(torch.arange(c, device=dev), lc)
+                offs = torch.cumsum(lc, 0) - lc
+                rank_c = (torch.arange(tok_c.numel(), device=dev)
+                          - torch.repeat_interleave(offs, lc))
+                flat_c = local_eidx * max_cc + rank_c           # 块内 padded 位置
+                x_c = hidden_states.index_select(0, tok_c)      # [n_c, H] 可微
+                px_c = (torch.zeros(c * max_cc, H, dtype=hidden_states.dtype,
+                                    device=dev)
+                        .scatter(0, flat_c.unsqueeze(1).expand(-1, H), x_c)
+                        .view(c, max_cc, H))
+                pw_c = (torch.zeros(c * max_cc, dtype=w_c.dtype, device=dev)
+                        .scatter(0, flat_c, w_c)
+                        .view(c, max_cc))
 
-            # 命中专家的 int4 权重反量化。优先整层一次大 kernel（批量反量化），
-            # 失败则退回逐专家反量化（仍然保留 grouped 的 bmm），不让 GEMM 提速也丢掉。
-            gu_w = [self.gate_up[e].weight for e in hit_list]
-            dn_w = [self.down[e].weight for e in hit_list]
-            dq_dtype = getattr(gu_w[0].quant_state, "dtype", torch.bfloat16)
-            with torch.no_grad():
-                Wg = Wd = None
-                if not self._batched_dequant_broken:
-                    try:
-                        Wg = _dequant_experts_batched(gu_w, (Eh, 2 * I, H), dev)
-                        Wd = _dequant_experts_batched(dn_w, (Eh, H, I), dev)
-                    except Exception as exc:                   # noqa: BLE001
-                        self._batched_dequant_broken = True
-                        print(f"[moe] 批量反量化失败，退回逐专家反量化："
-                              f"{type(exc).__name__}: {exc}", flush=True)
-                if Wg is None:
-                    Wg = torch.empty(Eh, 2 * I, H, dtype=dq_dtype, device=dev)
-                    Wd = torch.empty(Eh, H, I, dtype=dq_dtype, device=dev)
-                    for i, (gwp, dwp) in enumerate(zip(gu_w, dn_w)):
-                        dequantize_4bit(gwp.data.view(-1, 1), gwp.quant_state,
-                                        out=Wg[i])
-                        dequantize_4bit(dwp.data.view(-1, 1), dwp.quant_state,
-                                        out=Wd[i])
+                # 本块专家权重反量化（批量；失败退回逐专家，仍保留 bmm）
+                gu_w = [self.gate_up[e].weight for e in hit_list[i0:i1]]
+                dn_w = [self.down[e].weight for e in hit_list[i0:i1]]
+                with torch.no_grad():
+                    Wg = Wd = None
+                    if not self._batched_dequant_broken:
+                        try:
+                            Wg = _dequant_experts_batched(gu_w, (c, 2 * I, H), dev)
+                            Wd = _dequant_experts_batched(dn_w, (c, H, I), dev)
+                        except Exception as exc:               # noqa: BLE001
+                            self._batched_dequant_broken = True
+                            print(f"[moe] 批量反量化失败，退回逐专家反量化："
+                                  f"{type(exc).__name__}: {exc}", flush=True)
+                    if Wg is None:
+                        Wg = torch.empty(c, 2 * I, H, dtype=dq_dtype, device=dev)
+                        Wd = torch.empty(c, H, I, dtype=dq_dtype, device=dev)
+                        for i, (gwp, dwp) in enumerate(zip(gu_w, dn_w)):
+                            dequantize_4bit(gwp.data.view(-1, 1), gwp.quant_state,
+                                            out=Wg[i])
+                            dequantize_4bit(dwp.data.view(-1, 1), dwp.quant_state,
+                                            out=Wd[i])
 
-            gu = torch.bmm(px.to(dq_dtype), Wg.transpose(1, 2))   # [Eh, max_c, 2I]
-            gate, up = gu.chunk(2, dim=-1)
-            act = self.act_fn(gate) * up
-            down = torch.bmm(act, Wd.transpose(1, 2))             # [Eh, max_c, H]
-            down = down * pw.unsqueeze(-1).to(down.dtype)
-            route_out = down.reshape(Eh * max_c, H).gather(
-                0, flat_idx.unsqueeze(1).expand(-1, H))
-            final.index_add_(0, tok, route_out.to(final.dtype))
+                gu = torch.bmm(px_c.to(dq_dtype), Wg.transpose(1, 2))  # [c,max_cc,2I]
+                gate, up = gu.chunk(2, dim=-1)
+                act = self.act_fn(gate) * up
+                dn = torch.bmm(act, Wd.transpose(1, 2))                # [c,max_cc,H]
+                dn = dn * pw_c.unsqueeze(-1).to(dn.dtype)
+                route_out = dn.reshape(c * max_cc, H).gather(
+                    0, flat_c.unsqueeze(1).expand(-1, H))              # [n_c, H]
+                final.index_add_(0, tok_c, route_out.to(final.dtype))
             return final
 
     Qwen3_5MoeExperts.__name__ = base_cls.__name__

@@ -22,7 +22,8 @@ from rnaqwen.qwen36 import (make_quant_experts_cls, set_experts_impl,  # noqa: E
 
 
 class _Cfg:
-    num_experts = 8
+    # 80 > grouped 的 CHUNK=32，保证测试覆盖多块路径
+    num_experts = 80
     hidden_size = 64
     moe_intermediate_size = 32
     hidden_act = "silu"
@@ -73,7 +74,7 @@ def main() -> int:
         print("FAIL: 批量反量化与逐专家不一致")
         return 1
 
-    T, H, K = 16, _Cfg.hidden_size, 2
+    T, H, K = 96, _Cfg.hidden_size, 2
     x = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
     idx = torch.randint(0, _Cfg.num_experts, (T, K), device=dev)
     w = torch.softmax(torch.randn(T, K, device=dev), dim=-1)
