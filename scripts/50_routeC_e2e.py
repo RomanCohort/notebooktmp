@@ -993,6 +993,11 @@ def main() -> int:
     ap.add_argument("--base", choices=["qwen3-8b", "qwen36-35b"], default="qwen3-8b")
     ap.add_argument("--qwen36-mode", choices=["int4", "int8"], default="int4",
                     help="Qwen3.6 专家的量化位数。int8 显存 34.7 GiB，int4 18.3 GiB")
+    ap.add_argument("--experts", choices=["per_expert", "grouped"],
+                    default="per_expert",
+                    help="MoE 专家执行路径。per_expert = 原来逐专家 Linear4bit；"
+                         "grouped = 命中专家权重批量反量化 + bmm（实验性提速，"
+                         "异常自动退回 per_expert）")
     ap.add_argument("--lora-preset", default="C",
                     help="Qwen3.6 的 LoRA target 预设 A/B/C/D（见 rnaqwen.qwen36），"
                          "或逗号分隔的模块名。C = 190 模块 / 8.13 M")
@@ -1244,6 +1249,9 @@ def main() -> int:
     if not all(fast_path.values()):
         print("[perf] ** 正在走纯 PyTorch fallback；30 层 linear attention 会非常慢 **")
     print("\n=== 建模型 ===")
+    from rnaqwen.qwen36 import set_experts_impl
+    set_experts_impl(args.experts)
+    print(f"[moe] experts={args.experts}")
     model = E2EModel(args.lora_r, args.rna_emb, latent=LATENT, levels=LEVELS,
                      pool=args.pool,
                      base=args.base, base_mode=args.qwen36_mode,

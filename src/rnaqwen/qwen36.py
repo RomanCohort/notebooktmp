@@ -66,6 +66,27 @@ _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
 # 栈，只能靠"最后打印的是谁"定位 —— 2026-10-14 就是靠这个把崩溃点锁到具体张量的。
 _TRACE_GET = os.environ.get("RNAQWEN_TRACE_GET") == "1"
 
+# ---- 专家执行路径 ----------------------------------------------------------
+# per_expert: 原来的逐专家 Linear4bit 循环（默认，行为不变）
+# grouped:    先把命中专家的 int4 权重反量化到一块 batch 里，再用 bmm 做整层
+#             的专家 GEMM，把每层数百次小算子压成两次 bmm。
+#
+# 为什么用 bmm 而不是 torch._grouped_mm：
+#   在 torch 2.11.0+cu130 上实测 `torch._grouped_mm` 的前向能用，但**反向会抛**
+#   `RuntimeError: Invalid strides/sizes, got [0, 0] for strides and [16, 16] for sizes`
+#   —— 训练必须支持对 hidden_states 的梯度，所以走 autograd 稳定的 bmm。
+#   bnb 的 matmul_4bit 又强制 quant_state 为 2D，没法直接做批量 NV4 GEMM。
+_EXPERTS_IMPL = os.environ.get("RNAQ_EXPERTS", "per_expert").strip().lower()
+
+
+def set_experts_impl(mode: str) -> None:
+    """切换专家执行路径。只接受 per_expert / grouped。"""
+    global _EXPERTS_IMPL
+    mode = (mode or "").strip().lower()
+    if mode not in ("per_expert", "grouped"):
+        raise ValueError(f"未知 experts 实现 {mode!r}，只支持 per_expert / grouped")
+    _EXPERTS_IMPL = mode
+
 
 def base_spec_from_ckpt_args(cargs: dict) -> tuple[Path, dict]:
     """从训练 checkpoint 的 args 推出 (底座目录, E2EModel 的构造参数)。
@@ -264,8 +285,23 @@ def make_quant_experts_cls(base_cls):
                 nn.Linear(self.intermediate_dim, self.hidden_dim, bias=False)
                 for _ in range(self.num_experts)])
             self.act_fn = ACT2FN[config.hidden_act]
+            # grouped 路径一旦抛异常就永久退回逐专家，避免每层重复炸。
+            self._grouped_broken = False
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
+            # grouped 是**可选**路径：任何异常都退回逐专家，绝不让新路径静默出错。
+            if _EXPERTS_IMPL == "grouped" and not self._grouped_broken:
+                try:
+                    return self._forward_grouped(
+                        hidden_states, top_k_index, top_k_weights)
+                except Exception as exc:                       # noqa: BLE001
+                    self._grouped_broken = True
+                    print(f"[moe] grouped 路径失败，已退回逐专家："
+                          f"{type(exc).__name__}: {exc}", flush=True)
+            return self._forward_per_expert(
+                hidden_states, top_k_index, top_k_weights)
+
+        def _forward_per_expert(self, hidden_states, top_k_index, top_k_weights):
             final_hidden_states = torch.zeros_like(hidden_states)
             with torch.no_grad():
                 num_slots = top_k_index.size(-1)
@@ -295,6 +331,78 @@ def make_quant_experts_cls(base_cls):
                 final_hidden_states.index_add_(
                     0, token_idx, cur.to(final_hidden_states.dtype))
             return final_hidden_states
+
+        def _forward_grouped(self, hidden_states, top_k_index, top_k_weights):
+            """grouped expert execution：命中专家权重批量反量化 + bmm。
+
+            按 (expert, slot, token) 排序后，每个专家是一段连续路由。把命中
+            专家的 int4 权重反量化进 [E_hit, out, in] 的缓存，路由 token 按
+            (expert, 段内序号) 散射进 [E_hit, max_c, H]，然后用两次 bmm 做
+            整层的专家门控/下投影。权重是常量（冻结），autograd 只把梯度回传
+            给 hidden_states —— 满足「backward 支持输入梯度、基座 frozen」。
+            """
+            from bitsandbytes.functional import dequantize_4bit
+
+            E = self.num_experts
+            H = self.hidden_dim
+            I = self.intermediate_dim
+            K = top_k_index.size(-1)
+            dev = hidden_states.device
+            final = torch.zeros_like(hidden_states)
+
+            with torch.no_grad():
+                eid = top_k_index.reshape(-1)                  # [R] 每条路由的专家 id
+                R = eid.numel()
+                slot_all = torch.arange(R, device=dev) % K
+                order = torch.argsort(eid * K + slot_all, stable=True)
+                counts = torch.bincount(eid, minlength=E)      # [E]
+                tok = torch.div(order, K, rounding_mode="floor")   # [R] token 下标
+                slot = order - tok * K                              # [R] top-k 槽位
+                e_sorted = eid[order]                              # [R] 已按专家排序
+                starts = torch.cumsum(counts, 0) - counts          # [E]
+                rank = torch.arange(R, device=dev) - starts[e_sorted]  # 段内序号
+                hit = torch.nonzero(counts, as_tuple=False).flatten()
+                hit_list = hit.tolist()                        # 一次同步
+                Eh = len(hit_list)
+                if Eh == 0:
+                    return final
+                max_c = int(counts[hit].max().item())          # 每层一次同步
+                hit_map = torch.empty(E, dtype=torch.long, device=dev)
+                hit_map[hit] = torch.arange(Eh, device=dev)
+                ridx = hit_map[e_sorted]                       # [R] -> [0, Eh)
+
+            x = hidden_states[tok]                             # [R, H] 可微
+            w = top_k_weights[tok, slot]                       # [R]   可微
+            flat_idx = ridx * max_c + rank                     # [R]
+            # scatter（非原地）建 padded 路由缓存：梯度经它回到 x / w
+            px = (torch.zeros(Eh * max_c, H, dtype=hidden_states.dtype, device=dev)
+                  .scatter(0, flat_idx.unsqueeze(1).expand(-1, H), x)
+                  .view(Eh, max_c, H))
+            pw = (torch.zeros(Eh * max_c, dtype=w.dtype, device=dev)
+                  .scatter(0, flat_idx, w)
+                  .view(Eh, max_c))
+
+            # 命中专家的 int4 权重反量化进连续缓存（每个专家一次，不额外 stack）
+            qs0 = self.gate_up[hit_list[0]].weight.quant_state
+            dq_dtype = getattr(qs0, "dtype", torch.bfloat16)
+            Wg = torch.empty(Eh, 2 * I, H, dtype=dq_dtype, device=dev)
+            Wd = torch.empty(Eh, H, I, dtype=dq_dtype, device=dev)
+            with torch.no_grad():
+                for i, e in enumerate(hit_list):
+                    gw = self.gate_up[e].weight
+                    dw = self.down[e].weight
+                    dequantize_4bit(gw.data.view(-1, 1), gw.quant_state, out=Wg[i])
+                    dequantize_4bit(dw.data.view(-1, 1), dw.quant_state, out=Wd[i])
+
+            gu = torch.bmm(px.to(dq_dtype), Wg.transpose(1, 2))   # [Eh, max_c, 2I]
+            gate, up = gu.chunk(2, dim=-1)
+            act = self.act_fn(gate) * up
+            down = torch.bmm(act, Wd.transpose(1, 2))             # [Eh, max_c, H]
+            down = down * pw.unsqueeze(-1).to(down.dtype)
+            route_out = down.reshape(Eh * max_c, H).gather(
+                0, flat_idx.unsqueeze(1).expand(-1, H))
+            final.index_add_(0, tok, route_out.to(final.dtype))
+            return final
 
     Qwen3_5MoeExperts.__name__ = base_cls.__name__
     Qwen3_5MoeExperts.__qualname__ = base_cls.__qualname__
