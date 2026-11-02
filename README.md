@@ -19,18 +19,56 @@ that gives Qwen3.6-35B-A3B a native representation of RNA sequences, using
 SOS-LoRA (10.18653/v1/2026.acl-long.184) rather than a plain LoRA. A retrieval
 tool over the literature database (OpenHarness + RAG) is built on top of it.
 
-So the model has two jobs, and they are trained/evaluated separately:
+The work is split by whether a fact can be computed, retrieved, or neither:
 
-1. **Read the sequence** — turn a sequence into verifiable structured facts
-   (family, type, structural parameters, sequence detail). This is what the
-   adapter trains. Candidate discrimination is the first measurable proxy.
-2. **Ground literature claims** — with the RAG layer, decide whether two RNAs
-   have a documented relationship. The sequence representation keeps this from
-   hallucinating; the literature corpus supplies the facts.
+- **Computable** → a tool, not the model. Structure is ViennaRNA (MFE, pairing
+  fraction, stem lengths); family lookup is Rfam/HMMER; sequence detail is string
+  arithmetic. Making the model learn a property an O(1) algorithm computes exactly
+  is both unreliable and unnecessary.
+- **Retrievable** → RAG. Literature facts, functional descriptions, known
+  interactions.
+- **Neither** → the model. Reading a raw sequence and judging whether two
+  sequences are related, when no tool answers it directly.
 
-Literature facts themselves are retrieved, not memorised: family lookup is
-Rfam/HMMER, structure is ViennaRNA, and documents come from the corpus. What the
-model must learn is the part nothing else provides — how to read the sequence.
+That last part is what this repository trains. The first two are harness and
+adapter layers around it.
+
+### Target task: RNA-RNA relationship discrimination
+
+The end goal is literature-database maintenance: given two RNAs, decide whether
+they have a documented functional or regulatory relationship, with a literature
+snippet as evidence. The task ladder is ordered by how trustworthy the labels are:
+
+1. **miRNA-mRNA targeting** — MiRBench (CLASH / chimeric eCLIP, bias-corrected)
+   and TargetScan (~560k human/mouse pairs, 280k positive / 280k negative).
+   Cleanest labels, largest data, and both sequences fit the encoder window.
+2. **lncRNA-miRNA sponging** — starBase, DIANA-LncBase, RAID. lncRNAs often
+   exceed the 1024-nt window, so truncation or fragmentation policy matters.
+3. **General RNA-RNA associations** — NPInter v4, RNAInter. Positive-sample
+   quality varies; keep only those with explicit experimental descriptions.
+
+Sequence understanding is the prerequisite. The current 4-way candidate task
+(below) is a first, cheap proxy for it, trained on RNAcentral/Rfam data.
+
+### What RNAcentral gives us
+
+The existing corpus is 145,201 unique RNAs across 1,947 Rfam families (rRNA 52%,
+tRNA 12%, miRNA 3%, mRNA 2%, lncRNA 0%). It is a **sequence corpus, not a
+relationship-label corpus**:
+
+| resource | reuse |
+|---|---|
+| sequences + family annotations | yes — trains the sequence-understanding layer |
+| miRNA sequences (4,645 rows, 718 families) | yes — maps onto TargetScan miRNAs |
+| mRNA 3'UTR sequences | no — must come from Ensembl/GENCODE |
+| lncRNA sequences | no — must come from GENCODE/NONCODE |
+| miRNA-mRNA pair labels | no — must come from TargetScan/MiRBench |
+| literature evidence snippets | no — must come from PubMed |
+
+## Current proxy task: candidate discrimination (4-way)
+
+This is a first, cheap proxy for *sequence understanding* — it is not the target
+relationship task. It tests whether the adapter can tell RNAs apart at all.
 
 ## Task: candidate discrimination (4-way)
 
