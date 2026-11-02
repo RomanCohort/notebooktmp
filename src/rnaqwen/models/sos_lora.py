@@ -126,14 +126,21 @@ class SOSLoRALayer(nn.Module):
     def ortho_penalty(self) -> torch.Tensor:
         """论文的轻量正则：惩罚不同专家 A 之间的相关。
 
-        做法：把每个专家的 A 拉平成 (r, in)，归一化后两两算 |内积|，
-        只取 k≠j 的对。同专家内部不罚（论文明确 "cross-expert"）。
+        **不要先归一化。** 老版本写的是
+            dirs = a / ||a||;  penalty = sum(cos²) / (k(k-1))
+        两个除法把梯度压死了：A 的范数约 6.0，归一化让梯度除以 ||a||²≈36，
+        再除 k(k-1)=12，合计 432 倍衰减。实测（step 5550）单层梯度范数
+        2.0e-4，乘 coef=1.0 后对 A 的推动只有 4e-8/步 —— 相对 Adam 步长
+        2e-4 是 0.02%，等于没接上。惩罚项的值也小到 2e-5（占 ce 的 0.007%）。
+
+        现在直接罚**未归一化**的余弦平方：penalty = Σ_{k≠j} (a_k·a_j)² / (k(k-1))。
+        这样梯度尺度与 A 自身量级一致（不再是 1/||a||²），coef 才是有意义的
+        物理量。余弦仍由内积隐含 —— a_k·a_j 大就意味着方向接近。
         """
         if self.k <= 1:
             return torch.zeros((), device=self.A[0].device)
-        dirs = torch.stack([a.reshape(-1) for a in self.A], dim=0)
-        dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp_min(1e-9)
-        gram = dirs @ dirs.t()
+        flat = torch.stack([a.reshape(-1) for a in self.A], dim=0)   # [k, r*in]
+        gram = flat @ flat.t()                                        # [k, k]
         offdiag = gram.masked_select(
             ~torch.eye(self.k, dtype=torch.bool, device=gram.device)
         )
@@ -158,16 +165,23 @@ class SOSLoRALayer(nn.Module):
 
 
 def sos_lora_penalty(model: nn.Module) -> torch.Tensor:
-    """整个模型的跨专家正交正则之和，加进 loss 用。"""
+    """整个模型的跨专家正交正则，**按层平均**后加进 loss。
+
+    老版本是 `total += p` 对 190 个 SOS 层求和，再乘 coef —— 于是同一个
+    coef 在不同 preset（190 / 310 层）下含义完全不同，调参没有可比性。
+    改成按层平均：coef 就是「单层惩罚项的权重」，与层数无关。
+    """
     total = None
+    n = 0
     for m in model.modules():
         if isinstance(m, SOSLoRALayer) and m.k > 1:
             p = m.ortho_penalty()
             total = p if total is None else total + p
+            n += 1
     if total is None:
         dev = next(model.parameters()).device
         return torch.zeros((), device=dev)
-    return total
+    return total / n
 
 
 def count_sos_layers(model: nn.Module) -> int:
