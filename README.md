@@ -73,12 +73,23 @@ binary judgement over two raw sequences:
 
 ```
 <|im_start|>system
-<|im_end|><|im_start|>user
+<|im_end|>
+<|im_start|>user
 Q: <4 soft tokens: miRNA><4 soft tokens: mRNA>这条 miRNA 与这段 mRNA 窗口之间
 是否存在经实验验证的靶向关系？只回答「是」或「否」。
-<|im_end|><|im_start|>assistant
-Answer: 是
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+是
 ```
+
+The chat scaffold is rendered by the tokenizer's own `apply_chat_template(...,
+enable_thinking=False)`, not hand-built — Qwen3.6's no-think block is
+`<think>\n\n</think>\n\n`, which differs from Qwen3's. The answer follows the
+generation prompt directly; there is no extra `" A: "` separator.
 
 - **Encoder** — frozen ERNIE-RNA encodes each sequence separately (miRNA ≤ 23 nt,
   mRNA window 50 nt). Separate encoding keeps the short miRNA from being drowned
@@ -90,12 +101,16 @@ Answer: 是
   the discrete FSQ code channel both lost on a controlled bridge comparison —
   FSQ scored 25.8% / 25.2% on a 4-way probe, i.e. chance.
 - **LLM** — frozen Qwen3.6-35B-A3B int4 with SOS-LoRA adapters (r=8, k=4,
-  preset C). Training loss is CE on the first answer token at the position just
-  after `" A: "`, plus the SOS cross-expert orthogonality penalty
+  preset C). Training loss is CE on the first answer token at the last position
+  of the generation prompt, plus the SOS cross-expert orthogonality penalty
   (`sos_lora_penalty`, coef 1.0, averaged per layer — without it the K
-  subspaces collapse into one and SOS degenerates into plain LoRA). The same
-  position is used at eval, so train and test never disagree about where the
+  subspaces collapse into one and SOS degenerates into plain LoRA). The
+  position is an absolute index into `[prefix][soft][suffix]`, and
+  `make_batch` asserts on every batch that the next token there is the target.
+  Eval uses the same builder, so train and test cannot disagree about where the
   answer starts.
+- **Learning rates** — SOS-LoRA at 2e-4 (the value validated in the candidate
+  run); the two resamplers at 1e-3, because they start from random weights.
 - **Metric** — AUROC on `logit(是) − logit(否)`. Random is 0.5.
 
 Data is MiRBench (Zenodo 20540907, CC-BY-4.0): `AGO2_CLASH_Hejret2023`,
@@ -110,9 +125,13 @@ dicts was what hard-crashed local runs at model-load time; the script builds the
 model first and then reservoir-samples, and the notebook caps `--max-test`.
 
 The end of training optionally runs an **input-perturbation check**
-(`--perturb 1`): AUROC is recomputed with miRNAs permuted across rows, then with
-mRNAs permuted. Both should fall to ~0.5. A high AUROC that survives permutation
-means the model is exploiting something other than the sequences.
+(`--perturb 1`) and prints five numbers: normal AUROC; AUROC with miRNAs
+permuted across rows; with mRNAs permuted across rows; with each miRNA's bases
+shuffled in place; with each mRNA window's bases shuffled in place. All four
+perturbed values should fall to ~0.5. Row permutation tests whether the *pairing*
+is used; in-place shuffling keeps length and base composition but destroys the
+sequence, and is the stronger test because a row permutation can accidentally
+draw the same miRNA again.
 
 ## GitHub Release assets
 
@@ -153,6 +172,7 @@ The int4 base is 18.2 GiB; relation rows are short (miRNA 22 + mRNA 50 + prompt
 | `--batch` | `64` | ~5k tokens per step; well inside 40 GB |
 | `--grad-ckpt` | `1` | cheap here, and keeps the MoE transient buffers safe |
 | `--steps` | `8000` | ~2.6 epochs over 200k sampled rows (1 epoch ≈ 3,125 steps) |
+| `--lr` / `--lr-proj` | `2e-4` / `1e-3` | SOS adapters vs. randomly-initialised resamplers |
 | `--eval-every` / `--eval-n` | `500` / `2000` | AUROC every 500 steps on a mixed-source test subset |
 | `--save-every` / `--save-minutes` | `200` / `10` | ~1 s/step, so 10 minutes is the real bound; keep 3 |
 | `--perturb` | `1` | permutation check on both inputs at the end |

@@ -73,21 +73,29 @@ Colab 上的路径：代码 `/content/RNAQwen`，资产 `/content/rnaqwen_assets
 
 ```
 --max-train 200000 --max-test 20000     # 4.1M 条不能全读进内存
---batch 64 --steps 8000 --lr 1e-3
+--batch 64 --steps 8000 --lr 2e-4 --lr-proj 1e-3
 --eval-every 500 --eval-n 2000
 --save-every 200 --save-minutes 10 --keep-ckpt 3
 --grad-ckpt 1 --perturb 1 --tag rel
 ```
 
+`--lr` 是 SOS-LoRA 的（2e-4，50_routeC 验证过的值），`--lr-proj` 是 resampler 的
+（1e-3，随机初始化从零学）。两组分开，别合成一个 lr。
+
 - 每行只有约 80 token（miRNA ≤23 + mRNA 50 + 问题），batch 64 ≈ 5k token。
 - 20 万条是跨 CLASH/eCLIP/leftout 的均匀蓄水池样本，8000 步 ≈ 2.6 epoch。
 - 损失 = 答案首 token 的 CE + `1.0 × sos_lora_penalty`（按层平均）。启动时会
   打印一行 `[loss] CE + 1.0 * SOS 正交正则`；日志里的 `ce` 和 `sos` 是分开的。
-- 日志里该看到：`[data] train 200000 test 20000`、`[train] 可训 ~19 M`、
+- 启动时还应该看到（缺任何一条都说明校验没跑）：
+  `[enc] T->U 映射确认`、`[tok] 是=95761 否=96994 pad=...`、
+  `[train] 可训 19.15 M ... lr 0.0002 / 0.001`。
+- 日志里该看到：`[data] train 200000 test 20000`、
   每 50 步一行 `step ... ce ... sos ... 步/s`，每 500 步一行 `[eval@N] AUROC ...`。
 - loss 应该从 ~0.69 往下走；AUROC 随机是 0.5，**先看它是否稳定高于 0.5 并在爬**。
-- 训练结束（`--perturb 1`）会打印三行：
-  `正常 / 打乱 miRNA / 打乱 mRNA` 的 AUROC。打乱后应掉回 ~0.5。
+- 训练结束（`--perturb 1`）会打印五行：正常 / 行置换 miRNA / 行置换 mRNA /
+  打乱 miRNA 碱基 / 打乱 mRNA 碱基。后四行都应掉回 ~0.5。
+- 真实格式由 tokenizer 的 chat template 渲染（`<think>\n\n</think>\n\n`），
+  答案直接跟在生成提示后面，**没有** `" A: "` 脚手架；pred_pos 是拼接后的绝对下标。
 
 ## 5. 已知的坑
 
@@ -111,7 +119,41 @@ Colab 上的路径：代码 `/content/RNAQwen`，资产 `/content/rnaqwen_assets
 | `--resume` 报 tag 不符 | 正常，说明接错 checkpoint 了 |
 | 磁盘不够 | cell 8 的 90 GiB 检查会直接报错 |
 
-## 7. 训练之后
+## 7. 2026-11-02 彻查修掉的问题
+
+这些不是"优化"，是会让第一次 A100 跑出来一个看着正常、其实错位的结果。**别回退。**
+
+1. **`pred_pos` 坐标系错了（最严重）**。`make_batch` 里算的是 suffix 内部下标
+   `len(pre)-1`，但模型 `hs[arange, pred_pos]` 索引的是
+   `[prefix][soft][suffix]` 拼起来的整条序列。于是模型一直在读问题中间某个
+   token 的 hidden 去预测答案。现在按 `len(left) + 2*n_query + len(right) - 1`
+   算绝对下标，并且每个 batch 断言 `pred_pos` 的下一位就是目标 token。
+2. **chat 模板是手搓的，且是错的**。Qwen3.6 的 no-think 段是
+   `<think>\n\n</think>\n\n`（普通字符串），不是 Qwen3 的
+   `" thinking\n\n<｜end▁of▁thinking｜>\n\n"`（14 个 token、含 158819）；而且
+   `<|im_end|>` 后面漏了换行。现在用 tokenizer 自己的
+   `apply_chat_template(enable_thinking=False)` 渲染再切。
+3. **冻结的 ERNIE 被 `model.train()` 切成了训练模式**。它的 config 是
+   `hidden_dropout=0.1, attention_dropout=0.1`，于是每条训练样本的序列表示都
+   被随机丢 10%，而评测不会。`RelationModel.train()` 现在强制 `encoder.eval()`。
+4. **`model.to(DEV)` 会递归到 bitsandbytes int4 底座**。bnb 不支持量化后再 `.to()`。
+   改成只把两个 resampler 移到 GPU。
+5. **SOS 正交正则没接上**。已加，系数 1.0，按层平均。
+6. **checkpoint 不是原子写**，而 notebook 的同步线程每 60 s 扫 `step_*.pt` 上传，
+   可能传走半截的 200 MB 文件。改成写 `.tmp` 再 `os.replace`，上传前再验 zip。
+7. **resume 可能挑中 `best.pt`**（不带优化器状态、step 可能更早）。现在优先
+   `step_*.pt`；并且校验 tag、weights 字段和**张量数**，对不上直接报错。
+8. **学习率统一给了 1e-3**。SOS 在 50_routeC 上验证的是 2e-4，resampler 是随机
+   初始化。拆成两组。
+9. **DNA 字母表（T）**：MiRBench 是 T，ERNIE 词表只有 U。multimolecule 的
+   `RnaTokenizer` 默认 `replace_T_with_U=True`，但这是版本相关默认值 ——
+   启动时实测 `ACGT` 与 `ACGU` 编码相同，不同就报错。
+10. **数据审计**（本地实测）：train 2,503,675 / test 346,197 行；同一
+    (miRNA, mRNA窗口) 对跨 split 重叠 57 对（占 test 0.02%），标签冲突 15 对。
+    test 里 99.4% 来自 Manakov，CLASH 只有 1,018 行、Klimentova 954 行——
+    **AUROC 主要由 Manakov 决定**，别把它讲成跨数据集泛化。
+
+## 8. 训练之后
 
 - AUROC 正常 → 往上加 rung：lncRNA-miRNA（starBase/DIANA-LncBase/RAID）、
   general RNA-RNA（NPInter v4/RNAInter），再接 OpenHarness + RAG 的文献证据层。

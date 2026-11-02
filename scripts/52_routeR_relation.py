@@ -97,6 +97,20 @@ class RelationModel(nn.Module):
         self.rs_mi = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head)
         self.rs_mr = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head)
         self.n_query = n_query
+        self.encoder.eval()
+
+    def train(self, mode: bool = True):
+        """冻结的 ERNIE 必须永远 eval。
+
+        ERNIE-RNA 的 config 里 `hidden_dropout=0.1, attention_dropout=0.1`。
+        `nn.Module.train()` 会递归把 encoder 也切到 train —— 于是每条训练样本的
+        序列表示都被随机 dropout 10%，而评测时不会。这既让「冻结编码器」的假设
+        不成立，也让 train/eval 的输入分布不一致。LLM 底座保留 train 模式，
+        因为 SOS 的 LoRA dropout(0.05) 要靠它生效。
+        """
+        super().train(mode)
+        self.encoder.eval()
+        return self
 
     @staticmethod
     def _q_embed(emb_layer, batch):
@@ -113,8 +127,12 @@ class RelationModel(nn.Module):
         return body, llm.lm_head
 
     def forward(self, batch):
-        """batch: dict(mi_ids, mi_mask, mr_ids, mr_mask, q_ids, prefix_ids,
-                       suffix_ids, label_pos, labels)"""
+        """batch: dict(mi_seqs, mr_seqs, q_ids, q_mask, prefix_ids,
+                       suffix_ids, pred_pos, target_ids)
+
+        pred_pos 是 [prefix][soft][suffix] 拼接后的**绝对下标**，指向生成提示的
+        最后一个 token；该位置的 hidden 预测下一位，即答案首 token。
+        """
         # 1) 两条序列各自编码（ERNIE 冻结）
         with torch.no_grad():
             o_mi = self.encoder(batch["mi_seqs"])
@@ -144,6 +162,10 @@ class RelationModel(nn.Module):
                   use_cache=False).last_hidden_state
         B = hs.shape[0]
         pos = batch["pred_pos"].clamp(min=0)
+        if int(pos.max()) >= hs.shape[1]:
+            raise RuntimeError(
+                f"pred_pos {int(pos.max())} 越过序列长度 {hs.shape[1]}："
+                "make_batch 的下标口径和拼接顺序不一致")
         sel = hs[torch.arange(B, device=hs.device), pos]       # [B, llm_dim]
         logits = head(sel).float()                             # [B, V]
         return F.cross_entropy(logits, batch["target_ids"])
@@ -176,23 +198,52 @@ class RelationModel(nn.Module):
 # ---------------------------------------------------------------- 数据
 
 class Tok:
+    """Qwen 的 chat 头。**不手搓模板。**
+
+    手搓那版有两个错（2026-11-02 核对 tokenizer 实测）：
+      * `<|im_end|>` 后面漏了 `\\n`：正确是 `<|im_end|>\\n<|im_start|>`，
+        手搓出来是 `<|im_end|><|im_start|>`；
+      * no-think 段用的是 Qwen3 的 `" thinking\\n\\n<｜end▁of▁thinking｜>\\n\\n"`
+        （14 个 token，含 158819），而 Qwen3.6 的模板实际是
+        `"<think>\\n\\n</think>\\n\\n"`（[248068, 271, 248069, 271]）。
+        这等于每条训练样本的 assistant 前缀都和预训练分布不一致。
+
+    现在直接用 `apply_chat_template(..., enable_thinking=False)` 渲染，
+    用一个数据里不可能出现的哨兵定位软提示的插入点，再切成 left / right。
+    tokenizer 换了、模板改了，哨兵找不到就立刻报错，不会静默跑偏。
+    """
+
+    SENT = "ZZRNASOFTZZ"
+
     def __init__(self, tk):
         self.tk = tk
         self.base_vocab = tk.vocab_size
         self.pad_id = tk.pad_token_id if tk.pad_token_id is not None else tk.eos_token_id
         self.eos = tk.eos_token
-        self.im_start = tk("<|im_start|>", add_special_tokens=False).input_ids
-        self.im_end = tk("<|im_end|>", add_special_tokens=False).input_ids
-        self.sys_ids = self.im_start + tk("system").input_ids + tk("\n").input_ids
-        self.user_ids = (self.im_end + self.im_start + tk("user").input_ids
-                         + tk("\n").input_ids)
-        self.assistant_ids = (self.im_end + self.im_start + tk("assistant").input_ids
-                              + tk("\n").input_ids)
-        self.no_think = tk(" thinking\n\n<｜end▁of▁thinking｜>\n\n",
-                           add_special_tokens=False).input_ids
+        self._cache: dict[str, tuple[list[int], list[int]]] = {}
+        # 启动就验一次：模板里必须有哨兵，否则后面每个 batch 都会切错
+        self.split("ACGU")
 
     def enc(self, s):
         return self.tk(s, add_special_tokens=False).input_ids
+
+    def split(self, question: str) -> tuple[list[int], list[int]]:
+        """返回 (软提示之前, 软提示之后)。right 从问题正文开始。"""
+        hit = self._cache.get(question)
+        if hit is not None:
+            return hit
+        text = self.tk.apply_chat_template(
+            [{"role": "system", "content": ""},
+             {"role": "user", "content": "Q: " + self.SENT + question}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        )
+        i = text.find(self.SENT)
+        if i < 0:
+            raise RuntimeError(
+                "chat template 里找不到哨兵：tokenizer 或模板变了，拒绝按旧假设继续")
+        out = (self.enc(text[:i]), self.enc(text[i + len(self.SENT):]))
+        self._cache[question] = out
+        return out
 
 
 def load_rows(path: Path, split: str | None = None, limit: int = 0, seed: int = 7):
@@ -227,11 +278,24 @@ def load_rows(path: Path, split: str | None = None, limit: int = 0, seed: int = 
     return rows
 
 
-def make_batch(rows, tok, *, with_answer=True):
+def shuffled_seq(s: str, rng: random.Random) -> str:
+    """逐字符打乱：长度和碱基组成不变，具体序列被破坏。"""
+    chars = list(s)
+    rng.shuffle(chars)
+    return "".join(chars)
+
+
+def make_batch(rows, tok, *, with_answer=True, n_soft=8):
     """把一批 (miRNA, mRNA 窗口, 问题, 答案) 打包。
 
     with_answer=True  训练用：suffix 带答案，loss 算在答案首 token 上
     with_answer=False 评测用：suffix 到 " A: " 为止，末位即答案首 token 的预测位置
+
+    **pred_pos 是拼接后整条序列里的绝对下标**：
+        [prefix][soft × n_soft][suffix]
+    模型 forward 里 `hs[arange(B), pred_pos]` 直接按这个下标取 hidden，
+    所以必须把 prefix 和软提示的长度算进去。只算 suffix 内部下标会让模型
+    去读问题中间某个 token 的 hidden —— 能训，但读错了位置。
     """
     mi = [r["mirna"] for r in rows]
     mr = [r["mrna_window"] for r in rows]
@@ -245,51 +309,55 @@ def make_batch(rows, tok, *, with_answer=True):
     for i, x in enumerate(q_ids):
         q_t[i, :len(x)] = torch.tensor(x, device=DEV)
 
-    # prefix = sys+user+"Q: "；suffix = 问题 + assistant + no_think + " A: "
-    head = (tok.sys_ids + tok.user_ids + tok.enc("Q: "))
+    # prefix / suffix 由 tokenizer 自己的 chat template 渲染后切开：
+    #   prefix = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nQ: "
+    #   suffix = "<问题><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n A: "
+    # 软提示插在两者之间。模板由 Tok.split 负责，这里不再手拼 chat 头。
+    left, _ = tok.split(qs[0])
     # 问题向量取均值时只算真实 token：右 pad 会把 pad_id 的 embedding 混进来
     out = {"mi_seqs": mi, "mr_seqs": mr, "q_ids": q_t,
            "q_mask": q_t.ne(tok.pad_id)}
-    pref = [head] * len(rows)
-    p_len = len(head)
-    out["prefix_ids"] = torch.tensor([pref[0]] * len(rows), device=DEV)
+    out["prefix_ids"] = torch.tensor([left] * len(rows), device=DEV)
 
-    # suffix = 问题 + assistant + no_think + " A: " [+ 答案 + eos]
-    # **pred_pos 统一记录「答案前一位」**（即 " A: " 的最后一个 token）。
-    # 训练和推理都用同一个位置：模型在该位置的 hidden state 预测下一位，
-    # 也就是答案首 token。之前训练取 suffix_lens-2（答案本身）是错位的：
-    # 那个位置的 hidden 预测的是 eos，不是答案。
+    # pred_pos = 模板给 assistant 生成的最后一位（no-think 块之后的换行），
+    # 它在训练和推理里都是同一个位置：该位置的 hidden 预测下一位 = 答案首 token。
+    # 不额外加 " A: " 之类的脚手架 —— 模型预训练时答案就是直接跟在生成提示后面的。
     suffix, pred_pos = [], []
     for q in qs:
-        pre = tok.enc(q) + tok.assistant_ids + tok.no_think + tok.enc(" A: ")
-        pred_pos.append(len(pre) - 1)
-        suffix.append(pre)
+        _, right = tok.split(q)
+        pred_pos.append(len(left) + n_soft + len(right) - 1)
+        suffix.append(right)
     if with_answer:
         for i, a in enumerate(ans):
             suffix[i] = suffix[i] + tok.enc(a + tok.eos)
 
     s_len = max(len(x) for x in suffix)
     s_t = torch.full((len(rows), s_len), tok.pad_id, dtype=torch.long, device=DEV)
-    l_t = torch.full((len(rows), s_len), -100, dtype=torch.long, device=DEV)
     for i, s in enumerate(suffix):
         s_t[i, :len(s)] = torch.tensor(s, device=DEV)
-        if with_answer:
-            a_ids = tok.enc(" A: " + ans[i] + tok.eos)
-            n_head = len(s) - len(a_ids)
-            l_t[i, n_head:len(s)] = torch.tensor(s[n_head:], device=DEV)
     out["suffix_ids"] = s_t
-    out["labels"] = l_t
-    out["suffix_lens"] = torch.tensor([len(x) for x in suffix], device=DEV)
     out["pred_pos"] = torch.tensor(pred_pos, device=DEV)
     if with_answer:
-        # 目标是「是」或「否」的单 token id（已确认两者都是单 token）
+        # 目标是「是」或「否」的单 token id（启动时已校验两者都是单 token）
         yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
         no_id = tok.enc("否")[0] if tok.enc("否") else tok.enc("No")[0]
-        out["target_ids"] = torch.tensor(
+        target = torch.tensor(
             [yes_id if a == "是" or a == "Yes" else no_id for a in ans],
             device=DEV)
+        out["target_ids"] = target
         out["yes_id"] = yes_id
         out["no_id"] = no_id
+        # 不变量：pred_pos 的下一位必须就是目标 token。
+        # 这是防"下标口径悄悄错位"的最后一道闸——错位时 loss 照样在降，
+        # 但模型读的是问题中间某个 token 的 hidden，没人看得出来。
+        base = len(left) + n_soft
+        rel = out["pred_pos"] - base + 1
+        got = s_t[torch.arange(len(rows), device=DEV), rel]
+        if not torch.equal(got, target):
+            bad = (got != target).nonzero()[0].item()
+            raise RuntimeError(
+                f"pred_pos 错位：第 {bad} 行 pred_pos 的下一位是 {int(got[bad])}，"
+                f"目标是 {int(target[bad])}（prefix {len(left)} + soft {n_soft}）")
     return out
 
 
@@ -325,7 +393,10 @@ def main() -> int:
     ap.add_argument("--n-query", type=int, default=4, help="每条序列的软提示 token 数")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=2e-4,
+                    help="SOS-LoRA 的 lr；与 50_routeC_e2e.py 验证过的默认值一致")
+    ap.add_argument("--lr-proj", type=float, default=1e-3,
+                    help="resampler（随机初始化、从零学）的 lr，单独一组")
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--eval-n", type=int, default=400)
@@ -346,6 +417,9 @@ def main() -> int:
     ap.add_argument("--perturb", type=int, default=0,
                     help="训练结束后做输入扰动检验（打乱 miRNA / mRNA 看 AUROC 是否掉到 0.5）")
     args = ap.parse_args()
+    if args.max_train <= 0:
+        print("[warn] --max-train 0：会读入全部 train 行（约 250 万条、2-3 GB 内存）",
+              flush=True)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -364,6 +438,17 @@ def main() -> int:
     for p in encoder.parameters():
         p.requires_grad_(False)
     print(f"[enc] {args.encoder} hidden {encoder.hidden_size}", flush=True)
+
+    # MiRBench 给的是 DNA 字母表（T），ERNIE 的词表只有 U。multimolecule 的
+    # RnaTokenizer 默认 replace_T_with_U=True，但这是**版本相关的默认值**，
+    # 不能假设。实测一次：T 和 U 必须编成同一个 id。
+    _t = encoder.tokenizer("ACGT", add_special_tokens=False).input_ids
+    _u = encoder.tokenizer("ACGU", add_special_tokens=False).input_ids
+    if _t != _u:
+        raise RuntimeError(
+            "ERNIE tokenizer 没有把 T 映射成 U：MiRBench 序列是 DNA 字母表，"
+            f"直接喂会让约四分之一碱基变成 <unk>（ACGT={_t} vs ACGU={_u}）")
+    print("[enc] T->U 映射确认", flush=True)
 
     # ---- 35B 底座 + SOS-LoRA ----
     from rnaqwen.qwen36 import (load_qwen36_text, lora_targets,
@@ -396,6 +481,13 @@ def main() -> int:
                                    str(ROOT / "models/Qwen3.6-35B-A3B")))
     tk0 = AutoTokenizer.from_pretrained(str(base_dir))
     tok = Tok(tk0)
+    # 答案必须是单 token：CE 只算 pred_pos 的下一位。
+    for _a in ("是", "否"):
+        _ids = tok.enc(_a)
+        if len(_ids) != 1:
+            raise RuntimeError(f"答案 {_a!r} 不是单 token：{_ids}，CE 目标会错位")
+    print(f"[tok] 是={tok.enc('是')[0]}  否={tok.enc('否')[0]}  pad={tok.pad_id}",
+          flush=True)
     # 找 LLM 的 hidden dim
     body = base_m.model
     lm_body = body.language_model if hasattr(body, "language_model") else body
@@ -403,7 +495,12 @@ def main() -> int:
     print(f"[cfg] llm_dim {llm_dim}  n_query {args.n_query}", flush=True)
 
     model = RelationModel(base_m, encoder, llm_dim=llm_dim,
-                          enc_dim=encoder.hidden_size, n_query=args.n_query).to(DEV)
+                          enc_dim=encoder.hidden_size, n_query=args.n_query)
+    # **不要**对整体调 model.to(DEV)：base_m 是 bitsandbytes int4 模型，
+    # bnb 不支持量化后再 `.to()`，而 nn.Module.to() 会递归到每一个 4bit 参数。
+    # encoder 和底座已经在 cuda 上，只有两个 resampler 是新建在 CPU 的。
+    model.rs_mi.to(DEV)
+    model.rs_mr.to(DEV)
 
     # ---- 模型建好后再读数据（避免内存峰值叠加）----
     tr = load_rows(Path(args.data), "train", args.max_train, args.seed)
@@ -425,19 +522,42 @@ def main() -> int:
             pass
         print("[ckpt] gradient checkpointing 开", flush=True)
 
-    params = [p for p in model.parameters() if p.requires_grad]
+    # resampler 是随机初始化、从零开始学；SOS-LoRA 是接在预训练权重上的低秩增量。
+    # 两者用同一个 lr 没有道理：50_routeC 在 SOS 上验证过的是 2e-4，
+    # 而随机投影层用 2e-4 会学得很慢。分两组，各用各的。
+    sos_params, proj_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith(("rs_mi.", "rs_mr.")):
+            proj_params.append(p)
+        else:
+            sos_params.append(p)
+    params = sos_params + proj_params
     n_tr = sum(p.numel() for p in params)
-    print(f"[train] 可训 {n_tr/1e6:.2f} M（SOS + 2×resampler）", flush=True)
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+    n_proj = sum(p.numel() for p in proj_params)
+    print(f"[train] 可训 {n_tr/1e6:.2f} M（SOS {n_tr/1e6 - n_proj/1e6:.2f} M"
+          f" + resampler {n_proj/1e6:.2f} M）  lr {args.lr} / {args.lr_proj}",
+          flush=True)
+    opt = torch.optim.AdamW([
+        {"params": sos_params, "lr": args.lr},
+        {"params": proj_params, "lr": args.lr_proj},
+    ], weight_decay=0.01)
 
     yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
     no_id = tok.enc("否")[0] if tok.enc("否") else tok.enc("No")[0]
 
-    def run_eval(n, perm_mi=None, perm_mr=None):
-        """AUROC。perm_mi/perm_mr 是行置换：用这一批行的索引去取别的行的序列，
-        即「换个不配对的 miRNA / mRNA」——输入扰动检验用。"""
+    def run_eval(n, perm_mi=None, perm_mr=None, shuf_mi=False, shuf_mr=False):
+        """AUROC。
+
+        perm_*：行置换——用别的行的同字段替换，检验「配对关系」是否被用到。
+        shuf_*：**逐行打乱碱基顺序**——保留长度与碱基组成、破坏具体序列，
+                检验「具体序列」是否被用到。比行置换更严格：行置换如果碰巧
+                抽到同一条 miRNA，扰动就退化了。
+        """
         model.eval()
         rows = te[:n]
+        rng_s = random.Random(args.seed + 11)
         scores, labels = [], []
         B = 8
         with torch.no_grad():
@@ -450,7 +570,14 @@ def main() -> int:
                 if perm_mr is not None:
                     chunk = [dict(r, mrna_window=rows[perm_mr[j]]["mrna_window"])
                              for j, r in zip(idx, chunk)]
-                b = make_batch(chunk, tok, with_answer=False)
+                if shuf_mi:
+                    chunk = [dict(r, mirna=shuffled_seq(r["mirna"], rng_s))
+                             for r in chunk]
+                if shuf_mr:
+                    chunk = [dict(r, mrna_window=shuffled_seq(r["mrna_window"], rng_s))
+                             for r in chunk]
+                b = make_batch(chunk, tok, with_answer=False,
+                               n_soft=2 * args.n_query)
                 logits = model.predict(b)
                 # 「是」vs「否」的 logit 差作为正样本分数
                 scores += (logits[:, yes_id] - logits[:, no_id]).float().cpu().tolist()
@@ -468,7 +595,11 @@ def main() -> int:
                 "weights": trainable_state()}
         if with_optim:
             blob["optim"] = opt.state_dict()
-        torch.save(blob, path)
+        # 先写 .tmp 再原子改名：notebook 的同步线程每 60s 扫 step_*.pt 上传，
+        # 直接写目标文件会让它可能传走一个半截的 200 MB zip。
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(blob, tmp)
+        os.replace(tmp, path)
 
     def prune_steps():
         fs = sorted(ckdir.glob("step_*.pt"))
@@ -495,6 +626,12 @@ def main() -> int:
             if k in own:
                 own[k].data.copy_(v.to(own[k].device, own[k].dtype))
                 loaded += 1
+        expect = sum(1 for _, p in model.named_parameters() if p.requires_grad)
+        if loaded != expect:
+            # 张量数对不上 = 结构不同（n_query / 替换层数 / preset 变了）。
+            # 这时有一部分参数还是随机初始化的，接着训只会得到一个错位模型。
+            raise SystemExit(
+                f"{src} 只匹配到 {loaded}/{expect} 个可训张量，模型结构不一致")
         print(f"[load] {src}  {loaded} 个张量", flush=True)
         if args.resume:
             if "optim" in ck:
@@ -514,7 +651,7 @@ def main() -> int:
     last_save = time.time()
     for step in range(start_step + 1, args.steps + 1):
         chunk = [tr[(step * args.batch + j) % len(tr)] for j in range(args.batch)]
-        b = make_batch(chunk, tok)
+        b = make_batch(chunk, tok, n_soft=2 * args.n_query)
         loss = model.forward(b)
         l_sos = (pen_fn(model.llm) * args.sos_ortho_coef
                  if pen_fn is not None and args.sos_ortho_coef else None)
@@ -538,7 +675,8 @@ def main() -> int:
                 save_ckpt(ckdir / "best.pt", step, auc, with_optim=False)
                 print(f"  [best] 保存，AUROC {auc:.4f}", flush=True)
         due_steps = args.save_every > 0 and step % args.save_every == 0
-        due_time = time.time() - last_save >= 60.0 * args.save_minutes
+        due_time = (args.save_minutes > 0
+                    and time.time() - last_save >= 60.0 * args.save_minutes)
         if due_steps or due_time:
             save_ckpt(ckdir / f"step_{step:06d}.pt", step, best)
             prune_steps()
@@ -557,12 +695,16 @@ def main() -> int:
         perm_mr = list(range(n))
         rng.shuffle(perm_mr)
         base, _ = run_eval(n)
-        mi, _ = run_eval(n, perm_mi=perm_mi)
-        mr, _ = run_eval(n, perm_mr=perm_mr)
-        print("\n[perturb] 输入扰动检验", flush=True)
-        print(f"  正常        AUROC {base:.4f}", flush=True)
-        print(f"  打乱 miRNA  AUROC {mi:.4f}   (应 ~0.5)", flush=True)
-        print(f"  打乱 mRNA   AUROC {mr:.4f}   (应 ~0.5)", flush=True)
+        p_mi, _ = run_eval(n, perm_mi=perm_mi)
+        p_mr, _ = run_eval(n, perm_mr=perm_mr)
+        s_mi, _ = run_eval(n, shuf_mi=True)
+        s_mr, _ = run_eval(n, shuf_mr=True)
+        print("\n[perturb] 输入扰动检验（都应该掉到 ~0.5）", flush=True)
+        print(f"  正常          AUROC {base:.4f}", flush=True)
+        print(f"  行置换 miRNA  AUROC {p_mi:.4f}", flush=True)
+        print(f"  行置换 mRNA   AUROC {p_mr:.4f}", flush=True)
+        print(f"  打乱 miRNA    AUROC {s_mi:.4f}", flush=True)
+        print(f"  打乱 mRNA     AUROC {s_mr:.4f}", flush=True)
     return 0
 
 
