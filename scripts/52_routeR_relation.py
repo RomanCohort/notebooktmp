@@ -320,6 +320,8 @@ def main() -> int:
     ap.add_argument("--adapter", default="sos")
     ap.add_argument("--lora-r", type=int, default=8)
     ap.add_argument("--sos-k", type=int, default=4)
+    ap.add_argument("--sos-ortho-coef", type=float, default=1.0,
+                    help="SOS 跨专家正交正则的系数（按层平均，与 50_routeC 一致；0=关）")
     ap.add_argument("--n-query", type=int, default=4, help="每条序列的软提示 token 数")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch", type=int, default=8)
@@ -372,14 +374,22 @@ def main() -> int:
     for p in base_m.parameters():
         p.requires_grad_(False)
 
+    pen_fn = None
     if args.adapter == "sos":
-        from rnaqwen.models.sos_lora import replace_linear_with_sos
+        from rnaqwen.models.sos_lora import (replace_linear_with_sos,
+                                             sos_lora_penalty)
+        pen_fn = sos_lora_penalty
         rep = replace_linear_with_sos(base_m, tuple(lora_targets(args.lora_preset)),
                                       args.lora_r, args.sos_k, args.lora_r * 2,
                                       dropout=0.05, gamma_max=2.5)
         if not rep:
             raise RuntimeError("SOS 一层都没替换上")
         print(f"[sos] 替换 {len(rep)} 层", flush=True)
+        if args.sos_ortho_coef:
+            # SOS 的语义包含跨专家正交：不罚的话 K 个子空间会塌成一个，
+            # 等于退化成 K=1 的普通 LoRA。系数按层平均，与 50_routeC 同义。
+            print(f"[loss] CE + {args.sos_ortho_coef} * SOS 正交正则（按层平均）",
+                  flush=True)
 
     from transformers import AutoTokenizer
     base_dir = Path(os.environ.get("RNAQ_QWEN36_DIR",
@@ -506,13 +516,17 @@ def main() -> int:
         chunk = [tr[(step * args.batch + j) % len(tr)] for j in range(args.batch)]
         b = make_batch(chunk, tok)
         loss = model.forward(b)
+        l_sos = (pen_fn(model.llm) * args.sos_ortho_coef
+                 if pen_fn is not None and args.sos_ortho_coef else None)
+        total = loss if l_sos is None else loss + l_sos
         opt.zero_grad()
-        loss.backward()
+        total.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         if step % max(1, args.log_every) == 0:
             now = time.time()
-            print(f"  step {step:>5}  loss {float(loss):.4f}  "
+            sos_txt = "" if l_sos is None else f"  sos {float(l_sos):.4f}"
+            print(f"  step {step:>5}  ce {float(loss):.4f}{sos_txt}  "
                   f"{args.log_every / max(now - last_log, 1e-6):.2f} 步/s  "
                   f"段内 {now - t0:.0f}s", flush=True)
             last_log = now

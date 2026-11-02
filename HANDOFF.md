@@ -81,8 +81,10 @@ Colab 上的路径：代码 `/content/RNAQwen`，资产 `/content/rnaqwen_assets
 
 - 每行只有约 80 token（miRNA ≤23 + mRNA 50 + 问题），batch 64 ≈ 5k token。
 - 20 万条是跨 CLASH/eCLIP/leftout 的均匀蓄水池样本，8000 步 ≈ 2.6 epoch。
+- 损失 = 答案首 token 的 CE + `1.0 × sos_lora_penalty`（按层平均）。启动时会
+  打印一行 `[loss] CE + 1.0 * SOS 正交正则`；日志里的 `ce` 和 `sos` 是分开的。
 - 日志里该看到：`[data] train 200000 test 20000`、`[train] 可训 ~19 M`、
-  每 50 步一行 `step ... loss ... 步/s`，每 500 步一行 `[eval@N] AUROC ...`。
+  每 50 步一行 `step ... ce ... sos ... 步/s`，每 500 步一行 `[eval@N] AUROC ...`。
 - loss 应该从 ~0.69 往下走；AUROC 随机是 0.5，**先看它是否稳定高于 0.5 并在爬**。
 - 训练结束（`--perturb 1`）会打印三行：
   `正常 / 打乱 miRNA / 打乱 mRNA` 的 AUROC。打乱后应掉回 ~0.5。

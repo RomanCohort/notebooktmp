@@ -91,8 +91,11 @@ Answer: 是
   FSQ scored 25.8% / 25.2% on a 4-way probe, i.e. chance.
 - **LLM** — frozen Qwen3.6-35B-A3B int4 with SOS-LoRA adapters (r=8, k=4,
   preset C). Training loss is CE on the first answer token at the position just
-  after `" A: "`; the same position is used at eval, so train and test never
-  disagree about where the answer starts.
+  after `" A: "`, plus the SOS cross-expert orthogonality penalty
+  (`sos_lora_penalty`, coef 1.0, averaged per layer — without it the K
+  subspaces collapse into one and SOS degenerates into plain LoRA). The same
+  position is used at eval, so train and test never disagree about where the
+  answer starts.
 - **Metric** — AUROC on `logit(是) − logit(否)`. Random is 0.5.
 
 Data is MiRBench (Zenodo 20540907, CC-BY-4.0): `AGO2_CLASH_Hejret2023`,
