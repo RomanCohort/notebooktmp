@@ -70,8 +70,6 @@ relationship-label corpus**:
 This is a first, cheap proxy for *sequence understanding* — it is not the target
 relationship task. It tests whether the adapter can tell RNAs apart at all.
 
-## Task: candidate discrimination (4-way)
-
 Earlier runs asked the model to *generate* one of 1,947 free-text family names,
 with train and test families disjoint. Exact match was therefore structurally 0
 no matter how long it trained, and validation CE plateaued at step 1000.
