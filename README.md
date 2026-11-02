@@ -47,8 +47,9 @@ snippet as evidence. The task ladder is ordered by how trustworthy the labels ar
 3. **General RNA-RNA associations** — NPInter v4, RNAInter. Positive-sample
    quality varies; keep only those with explicit experimental descriptions.
 
-Sequence understanding is the prerequisite. The current 4-way candidate task
-(below) is a first, cheap proxy for it, trained on RNAcentral/Rfam data.
+Sequence understanding is the prerequisite. The repository trains the first rung
+(miRNA-mRNA targeting) on MiRBench; the RNAcentral/Rfam corpus and the earlier
+4-way candidate task remain as the sequence-understanding prelude.
 
 ### What RNAcentral gives us
 
@@ -65,59 +66,65 @@ relationship-label corpus**:
 | miRNA-mRNA pair labels | no — must come from TargetScan/MiRBench |
 | literature evidence snippets | no — must come from PubMed |
 
-## Current proxy task: candidate discrimination (4-way)
+## Current task: miRNA-target relationship discrimination
 
-This is a first, cheap proxy for *sequence understanding* — it is not the target
-relationship task. It tests whether the adapter can tell RNAs apart at all.
-
-Earlier runs asked the model to *generate* one of 1,947 free-text family names,
-with train and test families disjoint. Exact match was therefore structurally 0
-no matter how long it trained, and validation CE plateaued at step 1000.
-
-The current task gives the sequence plus four candidate families and asks for a
-letter:
+`scripts/52_routeR_relation.py` trains the task the project actually needs — a
+binary judgement over two raw sequences:
 
 ```
-Q: <RNA>...sequence...</RNA>Which of these Rfam families does this RNA belong to?
-A) RF01788
-B) RF00651
-C) RF00005
-D) RF00053
-Answer with the letter only.
-A: C
+<|im_start|>system
+<|im_end|><|im_start|>user
+Q: <4 soft tokens: miRNA><4 soft tokens: mRNA>这条 miRNA 与这段 mRNA 窗口之间
+是否存在经实验验证的靶向关系？只回答「是」或「否」。
+<|im_end|><|im_start|>assistant
+Answer: 是
 ```
 
-Family names appear in the prompt, so the model never has to memorise them, and
-the split is random — 100% of test families appear in train. Choices are balanced
-(A/B/C/D ≈ 25% each), so the random baseline is 25%.
+- **Encoder** — frozen ERNIE-RNA encodes each sequence separately (miRNA ≤ 23 nt,
+  mRNA window 50 nt). Separate encoding keeps the short miRNA from being drowned
+  by the mRNA and gives the LLM an unambiguous boundary.
+- **Projection** — one question-aware Perceiver resampler per sequence
+  (ChatNT, Nat Mach Intell 2025): the question embedding is added to the learned
+  queries, so the extracted soft prompt depends on what is being asked. Each
+  resampler emits 4 tokens, 8 total. Plain 1-token linear projection (RNA-GPT) and
+  the discrete FSQ code channel both lost on a controlled bridge comparison —
+  FSQ scored 25.8% / 25.2% on a 4-way probe, i.e. chance.
+- **LLM** — frozen Qwen3.6-35B-A3B int4 with SOS-LoRA adapters (r=8, k=4,
+  preset C). Training loss is CE on the first answer token at the position just
+  after `" A: "`; the same position is used at eval, so train and test never
+  disagree about where the answer starts.
+- **Metric** — AUROC on `logit(是) − logit(否)`. Random is 0.5.
 
-## GitHub Release asset
+Data is MiRBench (Zenodo 20540907, CC-BY-4.0): `AGO2_CLASH_Hejret2023`,
+`AGO2_eCLIP_Manakov2022` (train/test/leftout), `AGO2_eCLIP_Klimentova2022`
+(test). Negatives are bias-corrected by MiRBench, not random dinucleotides.
+`scripts/build_mirbench.py` converts the six `tsv.gz` files into
+`mirbench.jsonl` (4.13M rows: 2.85M `mirna_target`, 1.28M `mirna_region`).
 
-Create a release with tag `dataset-v3-cand` and upload:
+20,000 train rows are a uniform reservoir sample of the 2.5M target-task train
+rows, so CLASH and eCLIP are both represented. Reading all 4.1M rows into Python
+dicts was what hard-crashed local runs at model-load time; the script builds the
+model first and then reservoir-samples, and the notebook caps `--max-test`.
+
+The end of training optionally runs an **input-perturbation check**
+(`--perturb 1`): AUROC is recomputed with miRNAs permuted across rows, then with
+mRNAs permuted. Both should fall to ~0.5. A high AUROC that survives permutation
+means the model is exploiting something other than the sequences.
+
+## GitHub Release assets
+
+Training reads no GitHub dataset asset. The three assets still published are
+legacy from the FSQ route and are only needed by `scripts/50_routeC_e2e.py`:
 
 ```text
-rnaqa_v3_cand.jsonl           88 MB   sha256 d8704345d58b4db9...
+dataset-v3-cand/rnaqa_v3_cand.jsonl            88 MB
+codes-v3-cand/_rnaqa_v3_cand_codes.u16         18 MB
+codes-v3-cand/_rnaqa_v3_cand_codes_index.pt    5.5 MB
 ```
 
-Create a second release with tag `codes-v3-cand` and upload the code cache:
-
-```text
-_rnaqa_v3_cand_codes.u16      18 MB   sha256 134851c11291ea82...
-_rnaqa_v3_cand_codes_index.pt  5.5 MB sha256 a39f15baae38f983...
-```
-
-The notebook downloads them from:
-
-```text
-https://github.com/RomanCohort/notebooktmp/releases/download/dataset-v3-cand/rnaqa_v3_cand.jsonl
-https://github.com/RomanCohort/notebooktmp/releases/download/codes-v3-cand/_rnaqa_v3_cand_codes.u16
-https://github.com/RomanCohort/notebooktmp/releases/download/codes-v3-cand/_rnaqa_v3_cand_codes_index.pt
-```
-
-The code cache encodes 120,113 unique sequences (9,392,568 pooled positions) with
-the frozen FSQ tokenizer. Encoding takes about 30 minutes on a local ROCm APU —
-but only 10 minutes with `--sort-by-length`, which packs same-length sequences into
-one batch and removes most padding (9 seq/s → 163 seq/s, 17x).
+Checkpoints for the relation run sync to a separate release,
+`train-v3-rel`, so they can never be confused with the older candidate-task
+checkpoints in `train-v3-checkpoints`.
 
 ## Training
 
@@ -125,30 +132,27 @@ The notebook:
 
 1. clones this repository;
 2. downloads ERNIE-RNA and Qwen3.6-35B-A3B;
-3. downloads the published 25 MiB uint16 code cache (or regenerates it from the
-   final dataset and FSQ tokenizer as a fallback);
+3. downloads the six MiRBench files from Zenodo and builds `mirbench.jsonl`;
 4. runs resumable full training directly.
 
 The full-run cell samples GPU utilization every 0.75 seconds and prints a
 three-second window average plus peak, writes the raw samples to
-`runs/e2e_v3_cand/gpu_metrics.csv`, and reports min/median/mean/max window
+`runs/e2e_rel/gpu_metrics.csv`, and reports min/median/mean/max window
 utilization when the segment exits.
 
 ## A100 40GB settings
 
-`--token-budget 512` was an APU workaround: on the APU the binding constraint
-was unified system memory. On a 40GB A100 the binding constraint is activation
-memory, and the int4 base only takes 18.2 GiB.
+The int4 base is 18.2 GiB; relation rows are short (miRNA 22 + mRNA 50 + prompt
+≈ 80 tokens), so a batch of 64 is only ~5k tokens.
 
 | setting | value | why |
 |---|---|---|
-| `--token-budget` | `8192` | doubles the work covered by the fixed MoE dispatch cost |
-| `--batch` | `64` | hard cap on samples per step |
-| `--grad-ckpt` | `1` | keeps B*T=8192 within the 40GB A100 |
-| `--steps` | `8000` | ~4.8 epochs over 87,307 candidate rows (1 epoch ≈ 1,679 steps) |
-| `--min-steps` | `2000` | early-stop floor, ~1.2 epochs |
-| `--eval-every` / `--eval-n` | `250` / `64` | more eval points over a shorter run |
-| `--diag` | `0` | disable training-time diagnostics for throughput |
+| `--batch` | `64` | ~5k tokens per step; well inside 40 GB |
+| `--grad-ckpt` | `1` | cheap here, and keeps the MoE transient buffers safe |
+| `--steps` | `8000` | ~2.6 epochs over 200k sampled rows (1 epoch ≈ 3,125 steps) |
+| `--eval-every` / `--eval-n` | `500` / `2000` | AUROC every 500 steps on a mixed-source test subset |
+| `--save-every` / `--save-minutes` | `200` / `10` | ~1 s/step, so 10 minutes is the real bound; keep 3 |
+| `--perturb` | `1` | permutation check on both inputs at the end |
 
 ## MoE expert execution
 
@@ -194,34 +198,27 @@ The trainer prints `[profile]` timings for its first three steps: batch/data,
 model+LM loss, auxiliary loss, backward, and optimizer. The first step includes
 cold-start kernel initialization and is not representative; compare steps 2-3.
 
-If `--token-budget 8192` OOMs, use `--token-budget 6144 --batch 48`, then
-`--token-budget 4096 --batch 32`.
+The full-run cell wraps the trainer in `timeout --signal=TERM`, so a long run
+can span more than one Colab segment. Training resumes from the newest
+checkpoint each time; `--resume` restores the trainable weights, the AdamW
+state, and the step counter.
 
-The full-run cell wraps the trainer in `timeout --signal=TERM`, so an 8000-step
-run is expected to span more than one Colab segment. Training resumes from the
-newest checkpoint each time; the step counter is restored, so `--min-steps`
-accumulates across segments. The dataset has 1,060,818 QA rows total
-(831,390 train / 66,796 val / 162,632 test), so 23,250 steps must not be
-described as one epoch. Sampling is without replacement inside each epoch.
-
-The full-run cell prints per-step time, a three-step profile, and live GPU
-window utilization. If reserved VRAM approaches 39 GiB, fall back to 6144/48.
+The full-run cell prints per-step time and live GPU window utilization.
 
 Checkpoint sync is optional. To persist training across Colab runtimes, create a
 fine-grained GitHub token with Contents read/write permission and add it to
 Colab Secrets as `GITHUB_TOKEN`. The notebook stores the latest checkpoint in a
-release tagged `train-v3-checkpoints`.
+release tagged `train-v3-rel`.
 
-Checkpoints are saved every 50 steps or every 10 minutes, whichever comes
-first. The local runtime keeps the newest three snapshots. The background GitHub
-sync validates and uploads the newest complete snapshot. On completion it also
-uploads `final.pt`, `best.pt`, and a zipped `artifacts/` directory.
+Checkpoints are saved every 200 steps or every 10 minutes, whichever comes
+first — at ~1 s/step, the 10-minute bound is the one that actually fires on a
+slow segment. The local runtime keeps the newest three snapshots. The background
+GitHub sync uploads the newest complete snapshot and deletes the older remote
+step files. On completion it also uploads `best.pt`.
 
 Data, code, checkpoints, and artifacts live under `/content/rnaqwen_assets`, so
 refreshing the GitHub code checkout does not delete them. They are still
-runtime-local without a mounted persistent store or GitHub checkpoint sync. The
-FSQ encoder is frozen in this low-disk mode; the LLM adapter and code embedding
-table remain trainable.
+runtime-local without a mounted persistent store or GitHub checkpoint sync.
 
 GGUF quantization is a separate post-training step. It requires the original
 35B base model plus a machine with enough disk for an intermediate merged model
@@ -232,4 +229,5 @@ and the final GGUF; it is not run inside the training cell.
 - Dataset: https://github.com/RomanCohort/notebooktmp/releases/tag/dataset-v3
 - FSQ checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/fsq-stream-v1
 - Python 3.13 / torch 2.11 / CUDA 13 kernel wheel: https://github.com/RomanCohort/notebooktmp/releases/tag/kernel-wheels-v1
-- Checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/train-v3-checkpoints
+- Relation-task checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/train-v3-rel
+- Legacy candidate-task checkpoints: https://github.com/RomanCohort/notebooktmp/releases/tag/train-v3-checkpoints

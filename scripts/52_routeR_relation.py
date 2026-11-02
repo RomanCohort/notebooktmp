@@ -99,6 +99,13 @@ class RelationModel(nn.Module):
         self.n_query = n_query
 
     @staticmethod
+    def _q_embed(emb_layer, batch):
+        """问题 token 的 embedding 均值，只在真实 token 上取（排除右 pad）。"""
+        e = emb_layer(batch["q_ids"]).float()                  # [B,Lq,llm_dim]
+        m = batch["q_mask"].unsqueeze(-1).to(e.dtype)
+        return (e * m).sum(1) / m.sum(1).clamp(min=1.0)         # [B,llm_dim]
+
+    @staticmethod
     def lm_parts(llm):
         body = llm.model
         if hasattr(body, "language_model"):     # VLM
@@ -119,7 +126,7 @@ class RelationModel(nn.Module):
         emb_layer = body.embed_tokens
 
         # 2) 问题嵌入 = 问题文本过 LLM embedding 后取平均（不需要额外训练）
-        q_emb = emb_layer(batch["q_ids"]).float().mean(1)      # [B,llm_dim]
+        q_emb = self._q_embed(emb_layer, batch)
 
         # 3) 问题感知投影 -> 两段软提示
         s_mi = self.rs_mi(h_mi, m_mi, q_emb)                   # [B,nq,llm_dim]
@@ -150,7 +157,7 @@ class RelationModel(nn.Module):
         o_mr = self.encoder(batch["mr_seqs"])
         h_mi, m_mi = o_mi.hidden.float(), o_mi.mask.bool()
         h_mr, m_mr = o_mr.hidden.float(), o_mr.mask.bool()
-        q_emb = emb_layer(batch["q_ids"]).float().mean(1)
+        q_emb = self._q_embed(emb_layer, batch)
         soft = torch.cat([self.rs_mi(h_mi, m_mi, q_emb),
                           self.rs_mr(h_mr, m_mr, q_emb)], dim=1)
         p = emb_layer(batch["prefix_ids"]).float()
@@ -240,7 +247,9 @@ def make_batch(rows, tok, *, with_answer=True):
 
     # prefix = sys+user+"Q: "；suffix = 问题 + assistant + no_think + " A: "
     head = (tok.sys_ids + tok.user_ids + tok.enc("Q: "))
-    out = {"mi_seqs": mi, "mr_seqs": mr, "q_ids": q_t}
+    # 问题向量取均值时只算真实 token：右 pad 会把 pad_id 的 embedding 混进来
+    out = {"mi_seqs": mi, "mr_seqs": mr, "q_ids": q_t,
+           "q_mask": q_t.ne(tok.pad_id)}
     pref = [head] * len(rows)
     p_len = len(head)
     out["prefix_ids"] = torch.tensor([pref[0]] * len(rows), device=DEV)
@@ -326,8 +335,14 @@ def main() -> int:
     ap.add_argument("--max-test", type=int, default=20000,
                     help="最多加载多少 test 条")
     ap.add_argument("--tag", default="relation")
-    ap.add_argument("--save-every", type=int, default=100)
-    ap.add_argument("--keep-ckpt", type=int, default=2)
+    ap.add_argument("--save-every", type=int, default=200)
+    ap.add_argument("--save-minutes", type=float, default=10.0,
+                    help="距离上次保存超过这么多分钟也存一次（防 Colab 掉线丢步）")
+    ap.add_argument("--keep-ckpt", type=int, default=3)
+    ap.add_argument("--resume", default="", help="从 step_*.pt 恢复权重/优化器/步数")
+    ap.add_argument("--init", default="", help="只加载权重，步数从 0 开始")
+    ap.add_argument("--perturb", type=int, default=0,
+                    help="训练结束后做输入扰动检验（打乱 miRNA / mRNA 看 AUROC 是否掉到 0.5）")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -384,6 +399,9 @@ def main() -> int:
     tr = load_rows(Path(args.data), "train", args.max_train, args.seed)
     te = load_rows(Path(args.data), "test", args.max_test, args.seed + 1)
     random.Random(args.seed).shuffle(tr)
+    # 打乱 test：文件是按数据集顺序写的，不打乱的话 te[:eval_n] 会全是 CLASH，
+    # 每次评测只看一个来源。打乱后 eval 子集才覆盖 CLASH/eCLIP/leftout。
+    random.Random(args.seed + 1).shuffle(te)
     print(f"[data] train {len(tr):,}  test {len(te):,}", flush=True)
     assert tr and te, "需要 train 和 test 两个 split"
     if args.grad_ckpt:
@@ -402,30 +420,79 @@ def main() -> int:
     print(f"[train] 可训 {n_tr/1e6:.2f} M（SOS + 2×resampler）", flush=True)
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
 
-    def run_eval(n):
+    yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
+    no_id = tok.enc("否")[0] if tok.enc("否") else tok.enc("No")[0]
+
+    def run_eval(n, perm_mi=None, perm_mr=None):
+        """AUROC。perm_mi/perm_mr 是行置换：用这一批行的索引去取别的行的序列，
+        即「换个不配对的 miRNA / mRNA」——输入扰动检验用。"""
         model.eval()
         rows = te[:n]
         scores, labels = [], []
         B = 8
         with torch.no_grad():
             for i in range(0, len(rows), B):
-                chunk = rows[i:i + B]
+                idx = list(range(i, min(i + B, len(rows))))
+                chunk = [rows[j] for j in idx]
+                if perm_mi is not None:
+                    chunk = [dict(r, mirna=rows[perm_mi[j]]["mirna"])
+                             for j, r in zip(idx, chunk)]
+                if perm_mr is not None:
+                    chunk = [dict(r, mrna_window=rows[perm_mr[j]]["mrna_window"])
+                             for j, r in zip(idx, chunk)]
                 b = make_batch(chunk, tok, with_answer=False)
                 logits = model.predict(b)
                 # 「是」vs「否」的 logit 差作为正样本分数
-                yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
-                no_id = tok.enc("否")[0] if tok.enc("否") else tok.enc("No")[0]
-                y = (logits[:, yes_id] - logits[:, no_id]).float().cpu().tolist()
-                scores += y
+                scores += (logits[:, yes_id] - logits[:, no_id]).float().cpu().tolist()
                 labels += [r["label"] for r in chunk]
         model.train()
         return auroc(scores, labels), len(rows)
 
-    print(f"\n=== 训练 {args.steps} 步 ===", flush=True)
+    # ---- checkpoint：保存可训参数 + 优化器，能真正续训 ----
+    def trainable_state():
+        return {n: p.detach().to("cpu")
+                for n, p in model.named_parameters() if p.requires_grad}
+
+    def save_ckpt(path, step, auc, with_optim=True):
+        blob = {"step": step, "args": vars(args), "auroc": auc,
+                "weights": trainable_state()}
+        if with_optim:
+            blob["optim"] = opt.state_dict()
+        torch.save(blob, path)
+
+    def prune_steps():
+        fs = sorted(ckdir.glob("step_*.pt"))
+        for f in fs[:-args.keep_ckpt]:
+            f.unlink()
+
+    start_step, best = 0, -1.0
+    if args.resume or args.init:
+        src = args.resume or args.init
+        ck = torch.load(src, map_location="cpu", weights_only=False)
+        own = dict(model.named_parameters())
+        loaded = 0
+        for k, v in ck.get("weights", {}).items():
+            if k in own:
+                own[k].data.copy_(v.to(own[k].device, own[k].dtype))
+                loaded += 1
+        print(f"[load] {src}  {loaded} 个张量", flush=True)
+        if args.resume:
+            if "optim" in ck:
+                opt.load_state_dict(ck["optim"])
+                for st in opt.state.values():        # load_state_dict 留在 CPU
+                    for k, v in st.items():
+                        if isinstance(v, torch.Tensor):
+                            st[k] = v.to(DEV)
+            start_step = int(ck.get("step", 0))
+            best = float(ck.get("auroc", -1.0))
+            print(f"[resume] 从 step {start_step} 继续，best AUROC {best:.4f}", flush=True)
+
+    print(f"\n=== 训练 {start_step + 1} .. {args.steps} 步 ===", flush=True)
     model.train()
     t0 = time.time()
-    best = -1.0
-    for step in range(1, args.steps + 1):
+    last_log = time.time()
+    last_save = time.time()
+    for step in range(start_step + 1, args.steps + 1):
         chunk = [tr[(step * args.batch + j) % len(tr)] for j in range(args.batch)]
         b = make_batch(chunk, tok)
         loss = model.forward(b)
@@ -434,27 +501,44 @@ def main() -> int:
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         if step % max(1, args.log_every) == 0:
+            now = time.time()
             print(f"  step {step:>5}  loss {float(loss):.4f}  "
-                  f"{time.time()-t0:.0f}s", flush=True)
+                  f"{args.log_every / max(now - last_log, 1e-6):.2f} 步/s  "
+                  f"段内 {now - t0:.0f}s", flush=True)
+            last_log = now
         if step % args.eval_every == 0 or step == args.steps:
             auc, n = run_eval(args.eval_n)
             print(f"  [eval@{step}] AUROC {auc:.4f}  (n={n}, 随机 0.5)", flush=True)
             if auc > best:
                 best = auc
-                torch.save({"step": step, "resampler": {
-                    k: v for k, v in model.state_dict().items()
-                    if "rs_mi" in k or "rs_mr" in k},
-                    "sos": {k: v for k, v in model.llm.state_dict().items()
-                            if any(x in k for x in (".A.", ".B.", "scales"))},
-                    "args": vars(args), "auroc": auc},
-                    ckdir / "best.pt")
-        if args.save_every > 0 and step % args.save_every == 0:
-            torch.save({"step": step, "args": vars(args)},
-                       ckdir / f"step_{step:06d}.pt")
-            fs = sorted(ckdir.glob("step_*.pt"))
-            for f in fs[:-args.keep_ckpt]:
-                f.unlink()
+                save_ckpt(ckdir / "best.pt", step, auc, with_optim=False)
+                print(f"  [best] 保存，AUROC {auc:.4f}", flush=True)
+        due_steps = args.save_every > 0 and step % args.save_every == 0
+        due_time = time.time() - last_save >= 60.0 * args.save_minutes
+        if due_steps or due_time:
+            save_ckpt(ckdir / f"step_{step:06d}.pt", step, best)
+            prune_steps()
+            last_save = time.time()
+
     print(f"\n[best] AUROC {best:.4f}  ckpt {ckdir/'best.pt'}", flush=True)
+
+    # ---- 输入扰动检验：模型到底有没有在用两条序列？----
+    # 只看 AUROC 会被「问题文本 / 数据集来源」之类的捷径骗过去。
+    # 打乱 miRNA 或 mRNA 后 AUROC 应该掉回 ~0.5；如果不掉，说明模型没读那条序列。
+    if args.perturb:
+        n = min(args.eval_n, len(te))
+        rng = random.Random(args.seed + 5)
+        perm_mi = list(range(n))
+        rng.shuffle(perm_mi)
+        perm_mr = list(range(n))
+        rng.shuffle(perm_mr)
+        base, _ = run_eval(n)
+        mi, _ = run_eval(n, perm_mi=perm_mi)
+        mr, _ = run_eval(n, perm_mr=perm_mr)
+        print("\n[perturb] 输入扰动检验", flush=True)
+        print(f"  正常        AUROC {base:.4f}", flush=True)
+        print(f"  打乱 miRNA  AUROC {mi:.4f}   (应 ~0.5)", flush=True)
+        print(f"  打乱 mRNA   AUROC {mr:.4f}   (应 ~0.5)", flush=True)
     return 0
 
 

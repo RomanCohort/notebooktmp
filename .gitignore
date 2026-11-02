@@ -7,3 +7,5 @@ __pycache__/
 *.part
 tmp/
 data/processed/
+logs/
+*.bak.ipynb
