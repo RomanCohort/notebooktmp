@@ -469,6 +469,16 @@ def main() -> int:
     if args.resume or args.init:
         src = args.resume or args.init
         ck = torch.load(src, map_location="cpu", weights_only=False)
+        if args.resume:
+            # 不同任务的 checkpoint 结构不同（旧候选式的 step_*.pt 连权重都没有），
+            # 接上去只会得到一个悄悄错位的模型。宁可报错让人重跑。
+            ck_tag = (ck.get("args") or {}).get("tag")
+            if ck_tag != args.tag:
+                raise SystemExit(
+                    f"{src} 的 tag 是 {ck_tag!r}，本次是 {args.tag!r}；"
+                    "不同任务的 checkpoint 不能接")
+            if not ck.get("weights"):
+                raise SystemExit(f"{src} 没有 weights 字段，是旧格式的占位 checkpoint")
         own = dict(model.named_parameters())
         loaded = 0
         for k, v in ck.get("weights", {}).items():

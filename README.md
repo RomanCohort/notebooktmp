@@ -199,9 +199,11 @@ model+LM loss, auxiliary loss, backward, and optimizer. The first step includes
 cold-start kernel initialization and is not representative; compare steps 2-3.
 
 The full-run cell wraps the trainer in `timeout --signal=TERM`, so a long run
-can span more than one Colab segment. Training resumes from the newest
-checkpoint each time; `--resume` restores the trainable weights, the AdamW
-state, and the step counter.
+can span more than one Colab segment. `--resume` restores the trainable weights,
+the AdamW state, and the step counter. The cell only accepts a checkpoint from
+the `train-v3-rel` release whose stored `tag` is `rel` and which actually
+contains weights — an old candidate-task checkpoint is discarded, never
+half-loaded.
 
 The full-run cell prints per-step time and live GPU window utilization.
 
