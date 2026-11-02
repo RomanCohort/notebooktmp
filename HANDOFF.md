@@ -1,6 +1,6 @@
 # 交接 1 — RNAQwen v3 / MiRBench 关系判别
 
-> 写给下一个会话。代码状态：`main @ cfb127162eaff25c2113f12cd1c8c4c18627bddb`。
+> 写给下一个会话。代码状态：`main @ 4207426e57687ada74e1b33003a6c76f0a45bec5`。
 > 本地仓库 `C:\qwen-api\notebooktmp`，另一个非 git 目录 `C:\qwen-api\RNAQwen` 存着
 > `PLAN_v2.md`（设计记录，很长，按需查）和 `.gh_token`。
 
@@ -27,7 +27,7 @@ mRNA 窗口，判断两者是否存在经实验验证的靶向关系（是/否�
 - **还没在 A100 上完整跑过一次。** 下面所有时间/显存都是设计值，不是实测。
 
 钉死的 notebook 链接：
-https://colab.research.google.com/github/RomanCohort/notebooktmp/blob/cfb127162eaff25c2113f12cd1c8c4c18627bddb/RNAQwen_v3_Full.ipynb
+https://colab.research.google.com/github/RomanCohort/notebooktmp/blob/4207426e57687ada74e1b33003a6c76f0a45bec5/RNAQwen_v3_Full.ipynb
 
 ## 2. 新会话第一件事：Colab 怎么接
 
