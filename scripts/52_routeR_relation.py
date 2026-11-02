@@ -1,0 +1,432 @@
+"""RNA-RNA 关系判别：双序列输入 + 问题感知投影。
+
+为什么另起一个脚本
+------------------
+`50_routeC_e2e.py` 是围绕「单序列 -> FSQ 码 -> 查表」建的，`build_batch`
+只接受一个 RNA 占位段。关系判别需要两条序列，而且 FSQ 桥已实测不可行
+（4 选 1 上 25% = 随机水平），要换成 ChatNT 式的问题感知投影。
+
+所以这里新写一条链路，不破坏 50_ 的候选式训练。
+
+架构
+----
+    miRNA (22nt) ──ERNIE(冻结)──> [L1,768] ─┐
+                                            ├─ 问题感知 resampler ─> [8,2048] 软提示
+    mRNA (50nt) ──ERNIE(冻结)──> [L2,768] ─┘         ↑
+                                                问题嵌入
+    软提示 + "Q: " + 问题文本 + "A: " + 答案 ──> LLM(SOS-LoRA 可训, 底座冻结)
+
+为什么两条序列分开编码而不是拼接
+--------------------------------
+miRNA 只有 22 nt，拼进一条序列会被 50 nt 的 mRNA 淹没，模型也分不清哪段是哪个。
+分开编码后各出一个软提示段，边界清晰。
+
+用法
+----
+    # 小数据快速验证
+    python scripts/52_routeR_relation.py --data data/processed/mirbench_clash_zh.jsonl \
+        --steps 200 --batch 8
+
+    # A100 主力
+    python scripts/52_routeR_relation.py --data data/processed/mirbench.jsonl \
+        --steps 8000 --batch 32
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import time
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT / "src"))
+
+import rnaqwen  # noqa: F401  装 shim
+
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------- 投影层
+
+class QuestionAwareResampler(nn.Module):
+    """问题感知的 Perceiver resampler（ChatNT 的 English-aware projection）。
+
+    普通 resampler 对同一条序列永远给出同一组 embedding，与问题无关 —— 这是
+    信息瓶颈。这里把问题嵌入投影进 query，让抽取的表示随问题变化。
+
+    论文实测（ChatNT, Nat Mach Intell 2025）：问题感知 0.77 vs 普通 0.71 MCC。
+    """
+
+    def __init__(self, enc_dim: int, llm_dim: int, n_query: int = 4, n_head: int = 8):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(n_query, enc_dim) * 0.02)
+        self.q_proj = nn.Linear(llm_dim, enc_dim)          # 问题嵌入 -> query 空间
+        self.attn = nn.MultiheadAttention(enc_dim, n_head, batch_first=True)
+        self.gate = nn.Parameter(torch.zeros(1))           # Flamingo 的 gated xattn
+        self.out = nn.Linear(enc_dim, llm_dim)
+        self.n_query = n_query
+
+    def forward(self, hidden, mask, q_vec):
+        # hidden [B,L,enc_dim], mask [B,L] bool(True=有效), q_vec [B,llm_dim]
+        q = self.query.unsqueeze(0).expand(hidden.shape[0], -1, -1)
+        q = q + self.q_proj(q_vec).unsqueeze(1)            # [B,n_query,enc_dim]
+        a, _ = self.attn(q, hidden, hidden, key_padding_mask=~mask)
+        return self.out(torch.sigmoid(self.gate) * a)      # [B,n_query,llm_dim]
+
+
+# ---------------------------------------------------------------- 模型
+
+class RelationModel(nn.Module):
+    def __init__(self, base_m, encoder, llm_dim=2048, enc_dim=768,
+                 n_query=4, n_head=8, dtype=torch.bfloat16):
+        super().__init__()
+        self.llm = base_m
+        self.encoder = encoder
+        self.enc_dim = enc_dim
+        self.llm_dim = llm_dim
+        self.dtype = dtype
+        # 两条序列各一个 resampler（参数不共享：miRNA 和 mRNA 的特征尺度不同）
+        self.rs_mi = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head)
+        self.rs_mr = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head)
+        self.n_query = n_query
+
+    @staticmethod
+    def lm_parts(llm):
+        body = llm.model
+        if hasattr(body, "language_model"):     # VLM
+            return body.language_model, llm.lm_head
+        return body, llm.lm_head
+
+    def forward(self, batch):
+        """batch: dict(mi_ids, mi_mask, mr_ids, mr_mask, q_ids, prefix_ids,
+                       suffix_ids, label_pos, labels)"""
+        # 1) 两条序列各自编码（ERNIE 冻结）
+        with torch.no_grad():
+            o_mi = self.encoder(batch["mi_seqs"])
+            o_mr = self.encoder(batch["mr_seqs"])
+        h_mi, m_mi = o_mi.hidden.float(), o_mi.mask.bool()
+        h_mr, m_mr = o_mr.hidden.float(), o_mr.mask.bool()
+
+        body, head = self.lm_parts(self.llm)
+        emb_layer = body.embed_tokens
+
+        # 2) 问题嵌入 = 问题文本过 LLM embedding 后取平均（不需要额外训练）
+        q_emb = emb_layer(batch["q_ids"]).float().mean(1)      # [B,llm_dim]
+
+        # 3) 问题感知投影 -> 两段软提示
+        s_mi = self.rs_mi(h_mi, m_mi, q_emb)                   # [B,nq,llm_dim]
+        s_mr = self.rs_mr(h_mr, m_mr, q_emb)
+        soft = torch.cat([s_mi, s_mr], dim=1)                  # [B,2nq,llm_dim]
+
+        # 4) 文本部分
+        p = emb_layer(batch["prefix_ids"]).float()             # sys+user+"Q: "
+        s = emb_layer(batch["suffix_ids"]).float()             # 问题+assistant+no_think+"A: "
+        emb = torch.cat([p, soft.to(p.dtype), s], dim=1)       # [B, T, llm_dim]
+        attn = torch.ones(emb.shape[:2], dtype=torch.long, device=emb.device)
+
+        # 5) LLM 前向；pred_pos 是 " A: " 的最后一位，它预测下一位 = 答案首 token
+        hs = body(inputs_embeds=emb.to(self.dtype), attention_mask=attn,
+                  use_cache=False).last_hidden_state
+        B = hs.shape[0]
+        pos = batch["pred_pos"].clamp(min=0)
+        sel = hs[torch.arange(B, device=hs.device), pos]       # [B, llm_dim]
+        logits = head(sel).float()                             # [B, V]
+        return F.cross_entropy(logits, batch["target_ids"])
+
+    @torch.no_grad()
+    def predict(self, batch):
+        """返回第一个答案 token 上 Yes/No 的 logit 差（用于 AUROC）。"""
+        body, head = self.lm_parts(self.llm)
+        emb_layer = body.embed_tokens
+        o_mi = self.encoder(batch["mi_seqs"])
+        o_mr = self.encoder(batch["mr_seqs"])
+        h_mi, m_mi = o_mi.hidden.float(), o_mi.mask.bool()
+        h_mr, m_mr = o_mr.hidden.float(), o_mr.mask.bool()
+        q_emb = emb_layer(batch["q_ids"]).float().mean(1)
+        soft = torch.cat([self.rs_mi(h_mi, m_mi, q_emb),
+                          self.rs_mr(h_mr, m_mr, q_emb)], dim=1)
+        p = emb_layer(batch["prefix_ids"]).float()
+        s = emb_layer(batch["suffix_ids"]).float()
+        emb = torch.cat([p, soft.to(p.dtype), s], dim=1)
+        attn = torch.ones(emb.shape[:2], dtype=torch.long, device=emb.device)
+        hs = body(inputs_embeds=emb.to(self.dtype), attention_mask=attn,
+                  use_cache=False).last_hidden_state
+        # 与训练用同一个 pred_pos（" A: " 的最后一位），预测下一位 = 答案首 token
+        B = hs.shape[0]
+        pos = batch["pred_pos"].clamp(min=0)
+        sel = hs[torch.arange(B, device=hs.device), pos]
+        return head(sel).float()                              # [B, V]
+
+
+# ---------------------------------------------------------------- 数据
+
+class Tok:
+    def __init__(self, tk):
+        self.tk = tk
+        self.base_vocab = tk.vocab_size
+        self.pad_id = tk.pad_token_id if tk.pad_token_id is not None else tk.eos_token_id
+        self.eos = tk.eos_token
+        self.im_start = tk("<|im_start|>", add_special_tokens=False).input_ids
+        self.im_end = tk("<|im_end|>", add_special_tokens=False).input_ids
+        self.sys_ids = self.im_start + tk("system").input_ids + tk("\n").input_ids
+        self.user_ids = (self.im_end + self.im_start + tk("user").input_ids
+                         + tk("\n").input_ids)
+        self.assistant_ids = (self.im_end + self.im_start + tk("assistant").input_ids
+                              + tk("\n").input_ids)
+        self.no_think = tk(" thinking\n\n<｜end▁of▁thinking｜>\n\n",
+                           add_special_tokens=False).input_ids
+
+    def enc(self, s):
+        return self.tk(s, add_special_tokens=False).input_ids
+
+
+def load_rows(path: Path, split: str | None = None):
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            if r.get("kind") != "mirna_target":
+                continue
+            if split and r.get("split") != split:
+                continue
+            rows.append(r)
+    return rows
+
+
+def make_batch(rows, tok, *, with_answer=True):
+    """把一批 (miRNA, mRNA 窗口, 问题, 答案) 打包。
+
+    with_answer=True  训练用：suffix 带答案，loss 算在答案首 token 上
+    with_answer=False 评测用：suffix 到 " A: " 为止，末位即答案首 token 的预测位置
+    """
+    mi = [r["mirna"] for r in rows]
+    mr = [r["mrna_window"] for r in rows]
+    qs = [r["question"] for r in rows]
+    ans = [r["answer"] for r in rows]
+
+    q_ids = [tok.enc(q) for q in qs]
+    q_len = max(len(x) for x in q_ids)
+    # 问题 token（右 pad）
+    q_t = torch.full((len(rows), q_len), tok.pad_id, dtype=torch.long, device=DEV)
+    for i, x in enumerate(q_ids):
+        q_t[i, :len(x)] = torch.tensor(x, device=DEV)
+
+    # prefix = sys+user+"Q: "；suffix = 问题 + assistant + no_think + " A: "
+    head = (tok.sys_ids + tok.user_ids + tok.enc("Q: "))
+    out = {"mi_seqs": mi, "mr_seqs": mr, "q_ids": q_t}
+    pref = [head] * len(rows)
+    p_len = len(head)
+    out["prefix_ids"] = torch.tensor([pref[0]] * len(rows), device=DEV)
+
+    # suffix = 问题 + assistant + no_think + " A: " [+ 答案 + eos]
+    # **pred_pos 统一记录「答案前一位」**（即 " A: " 的最后一个 token）。
+    # 训练和推理都用同一个位置：模型在该位置的 hidden state 预测下一位，
+    # 也就是答案首 token。之前训练取 suffix_lens-2（答案本身）是错位的：
+    # 那个位置的 hidden 预测的是 eos，不是答案。
+    suffix, pred_pos = [], []
+    for q in qs:
+        pre = tok.enc(q) + tok.assistant_ids + tok.no_think + tok.enc(" A: ")
+        pred_pos.append(len(pre) - 1)
+        suffix.append(pre)
+    if with_answer:
+        for i, a in enumerate(ans):
+            suffix[i] = suffix[i] + tok.enc(a + tok.eos)
+
+    s_len = max(len(x) for x in suffix)
+    s_t = torch.full((len(rows), s_len), tok.pad_id, dtype=torch.long, device=DEV)
+    l_t = torch.full((len(rows), s_len), -100, dtype=torch.long, device=DEV)
+    for i, s in enumerate(suffix):
+        s_t[i, :len(s)] = torch.tensor(s, device=DEV)
+        if with_answer:
+            a_ids = tok.enc(" A: " + ans[i] + tok.eos)
+            n_head = len(s) - len(a_ids)
+            l_t[i, n_head:len(s)] = torch.tensor(s[n_head:], device=DEV)
+    out["suffix_ids"] = s_t
+    out["labels"] = l_t
+    out["suffix_lens"] = torch.tensor([len(x) for x in suffix], device=DEV)
+    out["pred_pos"] = torch.tensor(pred_pos, device=DEV)
+    if with_answer:
+        # 目标是「是」或「否」的单 token id（已确认两者都是单 token）
+        yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
+        no_id = tok.enc("否")[0] if tok.enc("否") else tok.enc("No")[0]
+        out["target_ids"] = torch.tensor(
+            [yes_id if a == "是" or a == "Yes" else no_id for a in ans],
+            device=DEV)
+        out["yes_id"] = yes_id
+        out["no_id"] = no_id
+    return out
+
+
+# ---------------------------------------------------------------- 评测
+
+def auroc(scores, labels):
+    """AUROC：正样本分数 > 负样本分数的概率（Mann-Whitney U）。"""
+    pos = [s for s, y in zip(scores, labels) if y == 1]
+    neg = [s for s, y in zip(scores, labels) if y == 0]
+    if not pos or not neg:
+        return float("nan")
+    wins = 0.0
+    for p in pos:
+        for n in neg:
+            wins += 1.0 if p > n else 0.5 if p == n else 0.0
+    return wins / (len(pos) * len(neg))
+
+
+# ---------------------------------------------------------------- 主流程
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="data/processed/mirbench_clash_zh.jsonl")
+    ap.add_argument("--encoder", default="models/ernierna")
+    ap.add_argument("--base", default="qwen36-35b")
+    ap.add_argument("--qwen36-mode", default="int4")
+    ap.add_argument("--lora-preset", default="C")
+    ap.add_argument("--adapter", default="sos")
+    ap.add_argument("--lora-r", type=int, default=8)
+    ap.add_argument("--sos-k", type=int, default=4)
+    ap.add_argument("--n-query", type=int, default=4, help="每条序列的软提示 token 数")
+    ap.add_argument("--steps", type=int, default=200)
+    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--eval-every", type=int, default=50)
+    ap.add_argument("--eval-n", type=int, default=400)
+    ap.add_argument("--grad-ckpt", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--tag", default="relation")
+    ap.add_argument("--save-every", type=int, default=100)
+    ap.add_argument("--keep-ckpt", type=int, default=2)
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    RUNS = Path(os.environ.get("RNAQ_RUNS_DIR", str(ROOT / "runs")))
+    outdir = RUNS / f"e2e_{args.tag}"
+    ckdir = outdir / "ckpt"
+    ckdir.mkdir(parents=True, exist_ok=True)
+
+    tr = load_rows(Path(args.data), "train")
+    te = load_rows(Path(args.data), "test")
+    random.Random(args.seed).shuffle(tr)
+    print(f"[data] train {len(tr):,}  test {len(te):,}", flush=True)
+    assert tr and te, "需要 train 和 test 两个 split"
+
+    # ---- 编码器（冻结）----
+    from rnaqwen.models.encoder import RnaEncoder
+    encoder = RnaEncoder(str(ROOT / args.encoder), dtype=torch.float32).to(DEV).eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+    print(f"[enc] {args.encoder} hidden {encoder.hidden_size}", flush=True)
+
+    # ---- 35B 底座 + SOS-LoRA ----
+    from rnaqwen.qwen36 import (load_qwen36_text, lora_targets,
+                                set_experts_impl, base_spec_from_ckpt_args)
+    set_experts_impl("grouped")
+    base_m, _text, _lmh, qstats = load_qwen36_text(mode=args.qwen36_mode)
+    print(f"[base] {qstats}", flush=True)
+    for p in base_m.parameters():
+        p.requires_grad_(False)
+
+    if args.adapter == "sos":
+        from rnaqwen.models.sos_lora import replace_linear_with_sos
+        rep = replace_linear_with_sos(base_m, tuple(lora_targets(args.lora_preset)),
+                                      args.lora_r, args.sos_k, args.lora_r * 2,
+                                      dropout=0.05, gamma_max=2.5)
+        if not rep:
+            raise RuntimeError("SOS 一层都没替换上")
+        print(f"[sos] 替换 {len(rep)} 层", flush=True)
+
+    from transformers import AutoTokenizer
+    base_dir = Path(os.environ.get("RNAQ_QWEN36_DIR",
+                                   str(ROOT / "models/Qwen3.6-35B-A3B")))
+    tk0 = AutoTokenizer.from_pretrained(str(base_dir))
+    tok = Tok(tk0)
+    # 找 LLM 的 hidden dim
+    body = base_m.model
+    lm_body = body.language_model if hasattr(body, "language_model") else body
+    llm_dim = lm_body.config.hidden_size
+    print(f"[cfg] llm_dim {llm_dim}  n_query {args.n_query}", flush=True)
+
+    model = RelationModel(base_m, encoder, llm_dim=llm_dim,
+                          enc_dim=encoder.hidden_size, n_query=args.n_query).to(DEV)
+    if args.grad_ckpt:
+        main_body = model.llm.model
+        (main_body.language_model if hasattr(main_body, "language_model")
+         else main_body).gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        try:
+            model.llm.enable_input_require_grads()
+        except Exception:
+            pass
+        print("[ckpt] gradient checkpointing 开", flush=True)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    n_tr = sum(p.numel() for p in params)
+    print(f"[train] 可训 {n_tr/1e6:.2f} M（SOS + 2×resampler）", flush=True)
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+
+    def run_eval(n):
+        model.eval()
+        rows = te[:n]
+        scores, labels = [], []
+        B = 8
+        with torch.no_grad():
+            for i in range(0, len(rows), B):
+                chunk = rows[i:i + B]
+                b = make_batch(chunk, tok, with_answer=False)
+                logits = model.predict(b)
+                # 「是」vs「否」的 logit 差作为正样本分数
+                yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
+                no_id = tok.enc("否")[0] if tok.enc("否") else tok.enc("No")[0]
+                y = (logits[:, yes_id] - logits[:, no_id]).float().cpu().tolist()
+                scores += y
+                labels += [r["label"] for r in chunk]
+        model.train()
+        return auroc(scores, labels), len(rows)
+
+    print(f"\n=== 训练 {args.steps} 步 ===", flush=True)
+    model.train()
+    t0 = time.time()
+    best = -1.0
+    for step in range(1, args.steps + 1):
+        chunk = [tr[(step * args.batch + j) % len(tr)] for j in range(args.batch)]
+        b = make_batch(chunk, tok)
+        loss = model.forward(b)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        if step % 10 == 0:
+            print(f"  step {step:>5}  loss {float(loss):.4f}  "
+                  f"{time.time()-t0:.0f}s", flush=True)
+        if step % args.eval_every == 0 or step == args.steps:
+            auc, n = run_eval(args.eval_n)
+            print(f"  [eval@{step}] AUROC {auc:.4f}  (n={n}, 随机 0.5)", flush=True)
+            if auc > best:
+                best = auc
+                torch.save({"step": step, "resampler": {
+                    k: v for k, v in model.state_dict().items()
+                    if "rs_mi" in k or "rs_mr" in k},
+                    "sos": {k: v for k, v in model.llm.state_dict().items()
+                            if any(x in k for x in (".A.", ".B.", "scales"))},
+                    "args": vars(args), "auroc": auc},
+                    ckdir / "best.pt")
+        if step % args.save_every == 0:
+            torch.save({"step": step, "args": vars(args)},
+                       ckdir / f"step_{step:06d}.pt")
+            fs = sorted(ckdir.glob("step_*.pt"))
+            for f in fs[:-args.keep_ckpt]:
+                f.unlink()
+    print(f"\n[best] AUROC {best:.4f}  ckpt {ckdir/'best.pt'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
