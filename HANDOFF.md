@@ -114,7 +114,7 @@ Colab 上的路径：代码 `/content/RNAQwen`，资产 `/content/rnaqwen_assets
 | 现象 | 先查 |
 |---|---|
 | OOM | 把 `--batch 64` 降到 32；`--eval-n` 降到 1000 |
-| AUROC 一直是 0.5 | loss 有没有降 → 正负样本是否平衡（mirbench.jsonl 里 train 正负约 1:1）→ `pred_pos` 是否指向「 A: 」最后一位 |
+| AUROC 一直是 0.5 | loss 有没有降 → 正负样本是否平衡（mirbench.jsonl 里 train 正负约 1:1）→ `pred_pos` 是否指向生成提示的最后一位（启动日志里有 `[tok]`/`[train]` 校验行） |
 | 打乱后 AUROC 不降 | 模型在走捷径（比如只看问题文本/数据集来源），**如实记录，不要粉饰** |
 | `--resume` 报 tag 不符 | 正常，说明接错 checkpoint 了 |
 | 磁盘不够 | cell 8 的 90 GiB 检查会直接报错 |
