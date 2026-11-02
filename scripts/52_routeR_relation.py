@@ -14,7 +14,7 @@
                                             ├─ 问题感知 resampler ─> [8,2048] 软提示
     mRNA (50nt) ──ERNIE(冻结)──> [L2,768] ─┘         ↑
                                                 问题嵌入
-    软提示 + "Q: " + 问题文本 + "A: " + 答案 ──> LLM(SOS-LoRA 可训, 底座冻结)
+    软提示 + "Q: " + 问题文本 + 答案 ──> LLM(SOS-LoRA 可训, 底座冻结)
 
 为什么两条序列分开编码而不是拼接
 --------------------------------
@@ -153,11 +153,11 @@ class RelationModel(nn.Module):
 
         # 4) 文本部分
         p = emb_layer(batch["prefix_ids"]).float()             # sys+user+"Q: "
-        s = emb_layer(batch["suffix_ids"]).float()             # 问题+assistant+no_think+"A: "
+        s = emb_layer(batch["suffix_ids"]).float()             # 问题 + assistant 头 + no-think 段
         emb = torch.cat([p, soft.to(p.dtype), s], dim=1)       # [B, T, llm_dim]
         attn = torch.ones(emb.shape[:2], dtype=torch.long, device=emb.device)
 
-        # 5) LLM 前向；pred_pos 是 " A: " 的最后一位，它预测下一位 = 答案首 token
+        # 5) LLM 前向；pred_pos 是生成提示的最后一位，它预测下一位 = 答案首 token
         hs = body(inputs_embeds=emb.to(self.dtype), attention_mask=attn,
                   use_cache=False).last_hidden_state
         B = hs.shape[0]
@@ -188,7 +188,7 @@ class RelationModel(nn.Module):
         attn = torch.ones(emb.shape[:2], dtype=torch.long, device=emb.device)
         hs = body(inputs_embeds=emb.to(self.dtype), attention_mask=attn,
                   use_cache=False).last_hidden_state
-        # 与训练用同一个 pred_pos（" A: " 的最后一位），预测下一位 = 答案首 token
+        # 与训练用同一个 pred_pos（生成提示最后一位），预测下一位 = 答案首 token
         B = hs.shape[0]
         pos = batch["pred_pos"].clamp(min=0)
         sel = hs[torch.arange(B, device=hs.device), pos]
@@ -289,7 +289,7 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
     """把一批 (miRNA, mRNA 窗口, 问题, 答案) 打包。
 
     with_answer=True  训练用：suffix 带答案，loss 算在答案首 token 上
-    with_answer=False 评测用：suffix 到 " A: " 为止，末位即答案首 token 的预测位置
+    with_answer=False 评测用：suffix 到生成提示为止，末位即答案首 token 的预测位置
 
     **pred_pos 是拼接后整条序列里的绝对下标**：
         [prefix][soft × n_soft][suffix]
@@ -311,7 +311,7 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
 
     # prefix / suffix 由 tokenizer 自己的 chat template 渲染后切开：
     #   prefix = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nQ: "
-    #   suffix = "<问题><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n A: "
+    #   suffix = "<问题><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     # 软提示插在两者之间。模板由 Tok.split 负责，这里不再手拼 chat 头。
     left, _ = tok.split(qs[0])
     # 问题向量取均值时只算真实 token：右 pad 会把 pad_id 的 embedding 混进来
