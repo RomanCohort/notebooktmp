@@ -104,9 +104,9 @@ memory, and the int4 base only takes 18.2 GiB.
 | `--token-budget` | `8192` | doubles the work covered by the fixed MoE dispatch cost |
 | `--batch` | `64` | hard cap on samples per step |
 | `--grad-ckpt` | `1` | keeps B*T=8192 within the 40GB A100 |
-| `--steps` | `11625` | preserves the previous total token budget |
-| `--min-steps` | `5000` | token-equivalent early-stop floor |
-| `--eval-every` / `--eval-n` | `500` / `16` | matches the previous token interval |
+| `--steps` | `8000` | ~4.8 epochs over 87,307 candidate rows (1 epoch ≈ 1,679 steps) |
+| `--min-steps` | `2000` | early-stop floor, ~1.2 epochs |
+| `--eval-every` / `--eval-n` | `250` / `64` | more eval points over a shorter run |
 | `--diag` | `0` | disable training-time diagnostics for throughput |
 
 ## MoE expert execution
@@ -156,7 +156,7 @@ cold-start kernel initialization and is not representative; compare steps 2-3.
 If `--token-budget 8192` OOMs, use `--token-budget 6144 --batch 48`, then
 `--token-budget 4096 --batch 32`.
 
-The full-run cell wraps the trainer in `timeout --signal=TERM`, so a 11625-step
+The full-run cell wraps the trainer in `timeout --signal=TERM`, so an 8000-step
 run is expected to span more than one Colab segment. Training resumes from the
 newest checkpoint each time; the step counter is restored, so `--min-steps`
 accumulates across segments. The dataset has 1,060,818 QA rows total
