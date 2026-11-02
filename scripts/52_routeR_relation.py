@@ -188,8 +188,19 @@ class Tok:
         return self.tk(s, add_special_tokens=False).input_ids
 
 
-def load_rows(path: Path, split: str | None = None):
-    rows = []
+def load_rows(path: Path, split: str | None = None, limit: int = 0, seed: int = 7):
+    """流式读取 + reservoir sampling。
+
+    **不能全读进内存。** PLAN §27 记过：把 150 万条 dict（约 1.2 GB）留着，
+    会和 35B 装载峰值叠加，在 safetensors 的 .item() 处硬崩 0xC0000005
+    （没有 Python 栈）。4.1M 条更不可能全留。
+
+    limit=0 表示不限制；>0 时用蓄水池采样均匀抽 limit 条，不偏向文件前部
+    （数据按数据集顺序写，取前 N 条会全是 CLASH）。
+    """
+    rng = random.Random(seed)
+    rows: list = []
+    seen = 0
     with path.open(encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
@@ -197,7 +208,15 @@ def load_rows(path: Path, split: str | None = None):
                 continue
             if split and r.get("split") != split:
                 continue
-            rows.append(r)
+            seen += 1
+            if limit <= 0:
+                rows.append(r)
+            elif len(rows) < limit:
+                rows.append(r)
+            else:
+                j = rng.randrange(seen)
+                if j < limit:
+                    rows[j] = r
     return rows
 
 
@@ -301,6 +320,11 @@ def main() -> int:
     ap.add_argument("--eval-n", type=int, default=400)
     ap.add_argument("--grad-ckpt", type=int, default=0)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--max-train", type=int, default=0,
+                    help="最多加载多少 train 条（0=全部）。必须限制：4.1M 条全读进内存"
+                         "会和 35B 装载峰值叠加导致 0xC0000005")
+    ap.add_argument("--max-test", type=int, default=20000,
+                    help="最多加载多少 test 条")
     ap.add_argument("--tag", default="relation")
     ap.add_argument("--save-every", type=int, default=100)
     ap.add_argument("--keep-ckpt", type=int, default=2)
@@ -313,11 +337,9 @@ def main() -> int:
     ckdir = outdir / "ckpt"
     ckdir.mkdir(parents=True, exist_ok=True)
 
-    tr = load_rows(Path(args.data), "train")
-    te = load_rows(Path(args.data), "test")
-    random.Random(args.seed).shuffle(tr)
-    print(f"[data] train {len(tr):,}  test {len(te):,}", flush=True)
-    assert tr and te, "需要 train 和 test 两个 split"
+    # ⚠️ 数据**在模型装载之后**再读（PLAN §27：先建模型再读数据，从没崩过；
+    #    反过来会在 safetensors 加载峰值上叠加 dict 内存 -> 0xC0000005）。
+    # 先记路径，模型建好后再 load_rows。
 
     # ---- 编码器（冻结）----
     from rnaqwen.models.encoder import RnaEncoder
@@ -357,6 +379,13 @@ def main() -> int:
 
     model = RelationModel(base_m, encoder, llm_dim=llm_dim,
                           enc_dim=encoder.hidden_size, n_query=args.n_query).to(DEV)
+
+    # ---- 模型建好后再读数据（避免内存峰值叠加）----
+    tr = load_rows(Path(args.data), "train", args.max_train, args.seed)
+    te = load_rows(Path(args.data), "test", args.max_test, args.seed + 1)
+    random.Random(args.seed).shuffle(tr)
+    print(f"[data] train {len(tr):,}  test {len(te):,}", flush=True)
+    assert tr and te, "需要 train 和 test 两个 split"
     if args.grad_ckpt:
         main_body = model.llm.model
         (main_body.language_model if hasattr(main_body, "language_model")
