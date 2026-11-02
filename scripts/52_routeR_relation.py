@@ -297,6 +297,7 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--eval-every", type=int, default=50)
+    ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--eval-n", type=int, default=400)
     ap.add_argument("--grad-ckpt", type=int, default=0)
     ap.add_argument("--seed", type=int, default=7)
@@ -403,7 +404,7 @@ def main() -> int:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
-        if step % 10 == 0:
+        if step % max(1, args.log_every) == 0:
             print(f"  step {step:>5}  loss {float(loss):.4f}  "
                   f"{time.time()-t0:.0f}s", flush=True)
         if step % args.eval_every == 0 or step == args.steps:
@@ -418,7 +419,7 @@ def main() -> int:
                             if any(x in k for x in (".A.", ".B.", "scales"))},
                     "args": vars(args), "auroc": auc},
                     ckdir / "best.pt")
-        if step % args.save_every == 0:
+        if args.save_every > 0 and step % args.save_every == 0:
             torch.save({"step": step, "args": vars(args)},
                        ckdir / f"step_{step:06d}.pt")
             fs = sorted(ckdir.glob("step_*.pt"))
