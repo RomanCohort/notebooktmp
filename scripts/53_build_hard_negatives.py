@@ -56,8 +56,27 @@ def hamming(a: str, b: str) -> int:
     return sum(1 for x, y in zip(a, b) if x != y) if len(a) == len(b) else 99
 
 
-def raw_path_for(source: str, split: str) -> Path | None:
-    cands = list((ROOT / "tmp/mirbench_raw").glob(f"{source}_*.tsv.gz"))
+def resolve_raw_dir(data_path: Path, explicit: str) -> Path | None:
+    """Locate the raw tsv.gz cache.
+
+    Local runs keep them in <repo>/tmp/mirbench_raw; the Colab notebook downloads
+    them next to mirbench.jsonl (DATA_DIR/mirbench_raw).  Getting this wrong
+    silently yields zero decoys because every family lookup misses, so the
+    caller must fail loudly instead of continuing.
+    """
+    if explicit:
+        p = Path(explicit)
+        return p if p.is_dir() else None
+    for cand in (data_path.parent / "mirbench_raw",
+                 ROOT / "tmp/mirbench_raw",
+                 ROOT / "data/processed/mirbench_raw"):
+        if cand.is_dir() and any(cand.glob("*.tsv.gz")):
+            return cand
+    return None
+
+
+def raw_path_for(raw_dir: Path, source: str, split: str) -> Path | None:
+    cands = list(raw_dir.glob(f"{source}_*.tsv.gz"))
     want = f"_{split}.tsv.gz"
     exact = [p for p in cands if p.name.endswith(want)]
     if exact:
@@ -68,13 +87,13 @@ def raw_path_for(source: str, split: str) -> Path | None:
     return other[0] if len(other) == 1 else None
 
 
-def load_families(sources: set[str]) -> tuple[dict[tuple[str, str, int], str],
-                                              dict[str, str]]:
+def load_families(raw_dir: Path, sources: set[str]) -> tuple[dict[tuple[str, str, int], str],
+                                                            dict[str, str]]:
     """(source, split, n) -> family, and miRNA sequence -> family."""
     key2fam: dict[tuple[str, str, int], str] = {}
     seq2fam: dict[str, str] = {}
     for source in sorted(sources):
-        files = [p for p in (ROOT / "tmp/mirbench_raw").glob(f"{source}_*.tsv.gz")
+        files = [p for p in raw_dir.glob(f"{source}_*.tsv.gz")
                  if "full_dataset" not in p.name]
         for p in files:
             split_raw = p.name[len(source) + 1:-len(".tsv.gz")]
@@ -113,6 +132,8 @@ def main() -> int:
                     help="允许的 seed 错配位数；0 表示必须完全相同")
     ap.add_argument("--max-per-mirna", type=int, default=0,
                     help="单个 decoy miRNA 的配额上限；0 表示不限制")
+    ap.add_argument("--raw-dir", default="",
+                    help="原始 tsv.gz 目录；留空则自动探测")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -162,7 +183,18 @@ def main() -> int:
           flush=True)
 
     # ---- families ---------------------------------------------------------
-    key2fam, seq2fam = load_families(sources)
+    raw_dir = resolve_raw_dir(data, args.raw_dir)
+    if raw_dir is None:
+        raise SystemExit(
+            "找不到原始 tsv.gz（noncodingRNA_fam 列只在那里）。"
+            "用 --raw-dir 指定，或先跑 build_mirbench 下载。"
+            f"已尝试: {data.parent / 'mirbench_raw'}, {ROOT / 'tmp/mirbench_raw'}")
+    print(f"[fam] raw dir {raw_dir}", flush=True)
+    key2fam, seq2fam = load_families(raw_dir, sources)
+    if not seq2fam:
+        raise SystemExit(
+            f"{raw_dir} 里没读到任何 miRNA 家族标注 —— 路径对了但文件不对，"
+            "拒绝生成一个全是 unknown 家族的 decoy 集合")
     print(f"[fam] {len(key2fam):,} raw rows, {len(seq2fam):,} miRNAs named",
           flush=True)
 
@@ -311,6 +343,12 @@ def main() -> int:
     if n < args.max_decoys:
         print(f"[warn] only {len(picked):,} candidates < requested {args.max_decoys:,}",
               flush=True)
+    # 写出空文件是这里最容易犯的错：文件存在，notebook 下一格就跳过生成，
+    # 训练则拿着 0 条困难负样本继续跑，指标看起来正常但实验已经废了。
+    if n == 0:
+        raise SystemExit(
+            "0 个 decoy —— 上游有问题（家族路径 / seed 映射 / 候选过滤），"
+            "拒绝写出空文件")
     rng.shuffle(picked)
     picked = picked[:n]
 
