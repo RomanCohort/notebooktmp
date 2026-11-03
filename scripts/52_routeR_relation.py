@@ -65,7 +65,8 @@ class QuestionAwareResampler(nn.Module):
     论文实测（ChatNT, Nat Mach Intell 2025）：问题感知 0.77 vs 普通 0.71 MCC。
     """
 
-    def __init__(self, enc_dim: int, llm_dim: int, n_query: int = 4, n_head: int = 8):
+    def __init__(self, enc_dim: int, llm_dim: int, n_query: int = 4, n_head: int = 8,
+                 feat_dim: int = 0):
         super().__init__()
         self.query = nn.Parameter(torch.randn(n_query, enc_dim) * 0.02)
         self.q_proj = nn.Linear(llm_dim, enc_dim)          # 问题嵌入 -> query 空间
@@ -73,9 +74,19 @@ class QuestionAwareResampler(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))           # Flamingo 的 gated xattn
         self.out = nn.Linear(enc_dim, llm_dim)
         self.n_query = n_query
+        # 逐位可及性通道。零初始化：step 0 与原模型逐位相同，特征平滑接入。
+        # 加在 hidden（key/value 侧）而不是 query：可及性是序列位置的属性，
+        # 不是"我要找什么"的属性；加到 query 会把两者混在一起。
+        self.feat_proj = None
+        if feat_dim > 0:
+            self.feat_proj = nn.Linear(feat_dim, enc_dim)
+            nn.init.zeros_(self.feat_proj.weight)
+            nn.init.zeros_(self.feat_proj.bias)
 
-    def forward(self, hidden, mask, q_vec):
+    def forward(self, hidden, mask, q_vec, feat=None):
         # hidden [B,L,enc_dim], mask [B,L] bool(True=有效), q_vec [B,llm_dim]
+        if self.feat_proj is not None and feat is not None:
+            hidden = hidden + self.feat_proj(feat)          # [B,L,enc_dim]
         q = self.query.unsqueeze(0).expand(hidden.shape[0], -1, -1)
         q = q + self.q_proj(q_vec).unsqueeze(1)            # [B,n_query,enc_dim]
         a, _ = self.attn(q, hidden, hidden, key_padding_mask=~mask)
@@ -86,17 +97,26 @@ class QuestionAwareResampler(nn.Module):
 
 class RelationModel(nn.Module):
     def __init__(self, base_m, encoder, llm_dim=2048, enc_dim=768,
-                 n_query=4, n_head=8, dtype=torch.bfloat16):
+                 n_query=4, n_head=8, dtype=torch.bfloat16, acc_dim=0,
+                 n_region=4):
         super().__init__()
         self.llm = base_m
         self.encoder = encoder
         self.enc_dim = enc_dim
         self.llm_dim = llm_dim
         self.dtype = dtype
+        self.acc_dim = acc_dim
         # 两条序列各一个 resampler（参数不共享：miRNA 和 mRNA 的特征尺度不同）
         self.rs_mi = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head)
-        self.rs_mr = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head)
+        # 可及性只在 mRNA 窗口上算，所以只有 rs_mr 接这个通道；
+        # 每个位置只有 1 维（unpaired 概率），所以 feat_dim 恒为 1。
+        # rs_mi 用 feat_dim=0，state dict 与旧版完全一致。
+        self.rs_mr = QuestionAwareResampler(enc_dim, llm_dim, n_query, n_head,
+                                            feat_dim=1 if acc_dim > 0 else 0)
         self.n_query = n_query
+        # 区域四分类辅助头。只在训练时用，predict() 不碰它，
+        # 导出 GGUF 时也不会出现在模型里。
+        self.region_head = nn.Linear(llm_dim, n_region)
         self.encoder.eval()
 
     def train(self, mode: bool = True):
@@ -126,6 +146,26 @@ class RelationModel(nn.Module):
             return body.language_model, llm.lm_head
         return body, llm.lm_head
 
+    def _acc_feat(self, batch, h_mr):
+        """把逐位可及性铺到编码器输出上：[BOS][50 nt][EOS] 的中间 50 位。
+
+        每个位置只有 1 维（该位的 unpaired 概率），所以 feat 形状是
+        [B, L, 1]，不是 [B, L, 50]。50 是序列长度，不是特征宽度。
+
+        `+2` 是 ERNIE 的 BOS/EOS。硬断言是防 tokenizer 变化时静默错位一位 ——
+        错位后形状仍然兼容，训练照样收敛，只是特征对错了位置。
+        """
+        acc = batch.get("acc")
+        if acc is None or self.acc_dim <= 0:
+            return None
+        L, n = h_mr.shape[1], acc.shape[1]
+        if L != n + 2:
+            raise RuntimeError(
+                f"可及性长度不匹配：编码器输出 {L} 位，缓存 {n} 位（应差 2，BOS/EOS）")
+        feat = h_mr.new_zeros(h_mr.shape[0], L, 1)
+        feat[:, 1:1 + n, 0] = acc
+        return feat
+
     def forward(self, batch):
         """batch: dict(mi_seqs, mr_seqs, q_ids, q_mask, prefix_ids,
                        suffix_ids, pred_pos, target_ids)
@@ -148,7 +188,7 @@ class RelationModel(nn.Module):
 
         # 3) 问题感知投影 -> 两段软提示
         s_mi = self.rs_mi(h_mi, m_mi, q_emb)                   # [B,nq,llm_dim]
-        s_mr = self.rs_mr(h_mr, m_mr, q_emb)
+        s_mr = self.rs_mr(h_mr, m_mr, q_emb, feat=self._acc_feat(batch, h_mr))
         soft = torch.cat([s_mi, s_mr], dim=1)                  # [B,2nq,llm_dim]
 
         # 4) 文本部分
@@ -168,7 +208,23 @@ class RelationModel(nn.Module):
                 "make_batch 的下标口径和拼接顺序不一致")
         sel = hs[torch.arange(B, device=hs.device), pos]       # [B, llm_dim]
         logits = head(sel).float()                             # [B, V]
-        return F.cross_entropy(logits, batch["target_ids"])
+
+        # 6) 两个头：靶向二分类为主，区域四分类为辅助
+        is_reg = batch.get("is_region")
+        if is_reg is None or not bool(is_reg.any()):
+            return {"target": F.cross_entropy(logits, batch["target_ids"])}
+        keep = ~is_reg
+        out = {}
+        if bool(keep.any()):
+            out["target"] = F.cross_entropy(
+                logits[keep], batch["target_ids"][keep])
+        reg_ids = batch["region_ids"][is_reg]
+        if bool((reg_ids >= 0).all()):
+            out["region"] = F.cross_entropy(
+                self.region_head(sel[is_reg]), reg_ids)
+        if "target" not in out:
+            out["target"] = logits.sum() * 0.0      # 整批都是 region 时的占位
+        return out
 
     @torch.no_grad()
     def predict(self, batch):
@@ -181,7 +237,8 @@ class RelationModel(nn.Module):
         h_mr, m_mr = o_mr.hidden.float(), o_mr.mask.bool()
         q_emb = self._q_embed(emb_layer, batch)
         soft = torch.cat([self.rs_mi(h_mi, m_mi, q_emb),
-                          self.rs_mr(h_mr, m_mr, q_emb)], dim=1)
+                          self.rs_mr(h_mr, m_mr, q_emb,
+                                     feat=self._acc_feat(batch, h_mr))], dim=1)
         p = emb_layer(batch["prefix_ids"]).float()
         s = emb_layer(batch["suffix_ids"]).float()
         emb = torch.cat([p, soft.to(p.dtype), s], dim=1)
@@ -246,6 +303,53 @@ class Tok:
         return out
 
 
+def load_region_rows(path: Path, split: str | None = None, limit: int = 0,
+                     seed: int = 7):
+    """区域四分类行。与 load_rows 完全分开，保证 run_eval 永远看不到它们。"""
+    rng = random.Random(seed)
+    rows: list = []
+    seen = 0
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            if r.get("kind") != "mirna_region":
+                continue
+            if split and r.get("split") != split:
+                continue
+            seen += 1
+            if limit <= 0:
+                rows.append(r)
+            elif len(rows) < limit:
+                rows.append(r)
+            else:
+                j = rng.randrange(seen)
+                if j < limit:
+                    rows[j] = r
+    return rows
+
+
+class AccCache:
+    """逐位可及性查表（memmap + 窗口字符串索引）。"""
+
+    def __init__(self, f16_path, idx_path):
+        import numpy as np
+        import torch as _t
+
+        idx = _t.load(idx_path, map_location="cpu", weights_only=False)
+        windows = idx["windows"].decode("utf-8").split("\n")
+        self.dim = int(idx["dim"])
+        self.n = int(idx["n"])
+        self._map = {w: i for i, w in enumerate(windows)}
+        self._mm = np.memmap(f16_path, dtype=np.float16, mode="r",
+                             shape=(self.n, self.dim))
+        if len(self._map) != self.n:
+            raise RuntimeError(f"可及性索引损坏：{len(self._map)} 个窗口 != {self.n}")
+
+    def get(self, window: str):
+        i = self._map.get((window or "").upper())
+        return None if i is None else self._mm[i]
+
+
 def load_rows(path: Path, split: str | None = None, limit: int = 0, seed: int = 7):
     """流式读取 + reservoir sampling。
 
@@ -285,7 +389,11 @@ def shuffled_seq(s: str, rng: random.Random) -> str:
     return "".join(chars)
 
 
-def make_batch(rows, tok, *, with_answer=True, n_soft=8):
+REGION_CLASSES = ["3'UTR", "5'UTR", "CDS", "Intron"]
+REGION_IDS = {name: i for i, name in enumerate(REGION_CLASSES)}
+
+
+def make_batch(rows, tok, *, with_answer=True, n_soft=8, acc=None, acc_dim=0):
     """把一批 (miRNA, mRNA 窗口, 问题, 答案) 打包。
 
     with_answer=True  训练用：suffix 带答案，loss 算在答案首 token 上
@@ -296,6 +404,11 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
     模型 forward 里 `hs[arange(B), pred_pos]` 直接按这个下标取 hidden，
     所以必须把 prefix 和软提示的长度算进去。只算 suffix 内部下标会让模型
     去读问题中间某个 token 的 hidden —— 能训，但读错了位置。
+
+    **prefix 是逐行的。** 靶向问题和区域问题的 chat 前缀目前恰好相同（都是
+    11 个 token），但右段不同（36 vs 41）。这里仍然逐行算 `pred_pos`，并且
+    断言整批 prefix 一致——将来模板分叉时会立刻报错，而不是静默把某一行
+    的问题塞到错误的位置。
     """
     mi = [r["mirna"] for r in rows]
     mr = [r["mrna_window"] for r in rows]
@@ -313,7 +426,16 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
     #   prefix = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nQ: "
     #   suffix = "<问题><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     # 软提示插在两者之间。模板由 Tok.split 负责，这里不再手拼 chat 头。
-    left, _ = tok.split(qs[0])
+    lefts, rights = [], []
+    for q in qs:
+        l, r = tok.split(q)
+        lefts.append(l)
+        rights.append(r)
+    left = lefts[0]
+    if any(x != left for x in lefts):
+        raise RuntimeError(
+            "同一批里的 chat 模板前缀不一致，pred_pos 无法共用基准；"
+            "要么拆批，要么让 make_batch 支持逐行 prefix")
     # 问题向量取均值时只算真实 token：右 pad 会把 pad_id 的 embedding 混进来
     out = {"mi_seqs": mi, "mr_seqs": mr, "q_ids": q_t,
            "q_mask": q_t.ne(tok.pad_id)}
@@ -322,11 +444,9 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
     # pred_pos = 模板给 assistant 生成的最后一位（no-think 块之后的换行），
     # 它在训练和推理里都是同一个位置：该位置的 hidden 预测下一位 = 答案首 token。
     # 不额外加 " A: " 之类的脚手架 —— 模型预训练时答案就是直接跟在生成提示后面的。
-    suffix, pred_pos = [], []
-    for q in qs:
-        _, right = tok.split(q)
-        pred_pos.append(len(left) + n_soft + len(right) - 1)
-        suffix.append(right)
+    base = len(left) + n_soft
+    suffix = list(rights)
+    pred_pos = [base + len(r) - 1 for r in rights]
     if with_answer:
         for i, a in enumerate(ans):
             suffix[i] = suffix[i] + tok.enc(a + tok.eos)
@@ -337,6 +457,16 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
         s_t[i, :len(s)] = torch.tensor(s, device=DEV)
     out["suffix_ids"] = s_t
     out["pred_pos"] = torch.tensor(pred_pos, device=DEV)
+
+    # ---- 任务类型：靶向二分类 vs 区域四分类 ----
+    is_region = torch.tensor(
+        [r.get("kind") == "mirna_region" for r in rows], device=DEV)
+    out["is_region"] = is_region
+    if is_region.any():
+        out["region_ids"] = torch.tensor(
+            [REGION_IDS.get(r["answer"], -1) if r.get("kind") == "mirna_region"
+             else 0 for r in rows], device=DEV)
+
     if with_answer:
         # 目标是「是」或「否」的单 token id（启动时已校验两者都是单 token）
         yes_id = tok.enc("是")[0] if tok.enc("是") else tok.enc("Yes")[0]
@@ -347,17 +477,37 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8):
         out["target_ids"] = target
         out["yes_id"] = yes_id
         out["no_id"] = no_id
-        # 不变量：pred_pos 的下一位必须就是目标 token。
+        # 不变量：pred_pos 的下一位必须就是答案首 token。
         # 这是防"下标口径悄悄错位"的最后一道闸——错位时 loss 照样在降，
         # 但模型读的是问题中间某个 token 的 hidden，没人看得出来。
-        base = len(left) + n_soft
+        # 两类行都追加了 answer+eos，所以对它们分别比对各自的答案 token：
+        # target 行比是/否，region 行比区域类别。
         rel = out["pred_pos"] - base + 1
         got = s_t[torch.arange(len(rows), device=DEV), rel]
-        if not torch.equal(got, target):
-            bad = (got != target).nonzero()[0].item()
+        want = target.clone()
+        if "region_ids" in out:
+            reg = is_region & (out["region_ids"] >= 0)
+            if bool(reg.any()):
+                region_first = torch.tensor(
+                    [tok.enc(r["answer"])[0] if r.get("kind") == "mirna_region"
+                     else 0 for r in rows], device=DEV)
+                want = torch.where(reg, region_first, want)
+        if not torch.equal(got, want):
+            bad = (got != want).nonzero()[0].item()
             raise RuntimeError(
                 f"pred_pos 错位：第 {bad} 行 pred_pos 的下一位是 {int(got[bad])}，"
-                f"目标是 {int(target[bad])}（prefix {len(left)} + soft {n_soft}）")
+                f"目标是 {int(want[bad])}（prefix {len(left)} + soft {n_soft}）")
+
+    # ---- 可及性特征（只对 mRNA 窗口有意义）----
+    if acc is not None and acc_dim > 0:
+        A = torch.zeros(len(rows), acc_dim, dtype=torch.float32, device=DEV)
+        for i, r in enumerate(rows):
+            vec = acc.get(r["mrna_window"])
+            if vec is None:
+                raise RuntimeError(
+                    f"可及性缓存里没有这个窗口（第 {i} 行）：{r['mrna_window'][:20]}…")
+            A[i] = torch.as_tensor(vec, dtype=torch.float32, device=DEV)
+        out["acc"] = A
     return out
 
 
@@ -376,6 +526,42 @@ def auroc(scores, labels):
     return wins / (len(pos) * len(neg))
 
 
+def mcc_at_best_threshold(scores, labels):
+    """MCC 和取得它的阈值。
+
+    为什么加 MCC：ChatNT 论文（Nat Mach Intell 2025）报的就是 MCC
+    （问题感知 0.77 vs 普通 0.71），我们之前只有 AUROC，没法跟文献直接比。
+    另外 AUROC 只看排序，MCC 同时看四个象限，对"模型输出整体偏移"更敏感。
+
+    **阈值必须在验证集上选**，不能用测试集选——否则 MCC 会虚高。
+    这里返回 (best_mcc, best_threshold)，调用方在 eval 子集上算完之后
+    应当把它当成"该阈值下的 MCC"，而不是无偏的测试指标。
+    """
+    pos = [s for s, y in zip(scores, labels) if y == 1]
+    neg = [s for s, y in zip(scores, labels) if y == 0]
+    n_pos, n_neg = len(pos), len(neg)
+    if not pos or not neg:
+        return float("nan"), float("nan")
+    # 候选阈值取所有分数的中点，避免落在样本分数上造成偏向
+    uniq = sorted(set(scores))
+    if len(uniq) == 1:
+        cands = [uniq[0] - 1e-6, uniq[0] + 1e-6]
+    else:
+        cands = [(a + b) / 2 for a, b in zip(uniq, uniq[1:])]
+        cands = [uniq[0] - 1e-6] + cands + [uniq[-1] + 1e-6]
+    best_mcc, best_t = -2.0, float("nan")
+    for t in cands:
+        tp = sum(1 for s in pos if s > t)
+        fp = sum(1 for s in neg if s > t)
+        fn = n_pos - tp
+        tn = n_neg - fp
+        denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        m = 0.0 if denom == 0 else (tp * tn - fp * fn) / denom
+        if m > best_mcc:
+            best_mcc, best_t = m, t
+    return best_mcc, best_t
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main() -> int:
@@ -391,6 +577,18 @@ def main() -> int:
     ap.add_argument("--sos-ortho-coef", type=float, default=1.0,
                     help="SOS 跨专家正交正则的系数（按层平均，与 50_routeC 一致；0=关）")
     ap.add_argument("--n-query", type=int, default=4, help="每条序列的软提示 token 数")
+    ap.add_argument("--acc-cache", default="",
+                    help="逐位可及性 memmap（_mirbench_acc.f16）")
+    ap.add_argument("--acc-idx", default="",
+                    help="可及性索引（_mirbench_acc.pt）")
+    ap.add_argument("--hard-neg", default="",
+                    help="困难负样本 jsonl（mirbench_hardneg.jsonl）")
+    ap.add_argument("--region-frac", type=float, default=0.0,
+                    help="批次里区域四分类行所占比例；0 表示不启用辅助任务")
+    ap.add_argument("--region-coef", type=float, default=0.1,
+                    help="区域辅助损失的权重")
+    ap.add_argument("--hard-frac", type=float, default=0.25,
+                    help="负样本里困难负样本所占比例")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-4,
@@ -494,13 +692,21 @@ def main() -> int:
     llm_dim = lm_body.config.hidden_size
     print(f"[cfg] llm_dim {llm_dim}  n_query {args.n_query}", flush=True)
 
+    acc = None
+    if args.acc_cache and args.acc_idx:
+        acc = AccCache(args.acc_cache, args.acc_idx)
+        print(f"[acc] {acc.n:,} windows, dim {acc.dim}", flush=True)
+    acc_dim = acc.dim if acc is not None else 0
+
     model = RelationModel(base_m, encoder, llm_dim=llm_dim,
-                          enc_dim=encoder.hidden_size, n_query=args.n_query)
+                          enc_dim=encoder.hidden_size, n_query=args.n_query,
+                          acc_dim=acc_dim)
     # **不要**对整体调 model.to(DEV)：base_m 是 bitsandbytes int4 模型，
     # bnb 不支持量化后再 `.to()`，而 nn.Module.to() 会递归到每一个 4bit 参数。
     # encoder 和底座已经在 cuda 上，只有两个 resampler 是新建在 CPU 的。
     model.rs_mi.to(DEV)
     model.rs_mr.to(DEV)
+    model.region_head.to(DEV)
 
     # ---- 模型建好后再读数据（避免内存峰值叠加）----
     tr = load_rows(Path(args.data), "train", args.max_train, args.seed)
@@ -511,6 +717,27 @@ def main() -> int:
     random.Random(args.seed + 1).shuffle(te)
     print(f"[data] train {len(tr):,}  test {len(te):,}", flush=True)
     assert tr and te, "需要 train 和 test 两个 split"
+
+    # ---- 困难负样本 ----
+    hard: list = []
+    if args.hard_neg:
+        hp = Path(args.hard_neg)
+        if hp.exists():
+            hard = load_rows(hp, None, args.max_train, args.seed + 3)
+            print(f"[hard] {len(hard):,} decoys", flush=True)
+        else:
+            print(f"[hard] 警告：{hp} 不存在，跳过困难负样本", flush=True)
+
+    # ---- 区域辅助任务 ----
+    region_pool: list = []
+    if args.region_frac > 0:
+        region_pool = load_region_rows(Path(args.data), "train",
+                                       args.max_train, args.seed + 5)
+        print(f"[aux] region pool {len(region_pool):,}  "
+              f"region-frac {args.region_frac}  coef {args.region_coef}",
+              flush=True)
+        if not region_pool:
+            raise RuntimeError("--region-frac > 0 但没有找到 mirna_region 行")
     if args.grad_ckpt:
         main_body = model.llm.model
         (main_body.language_model if hasattr(main_body, "language_model")
@@ -529,15 +756,19 @@ def main() -> int:
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if name.startswith(("rs_mi.", "rs_mr.")):
+        # region_head 也是随机初始化，必须跟投影层同一组；
+        # 落进 SOS 组会以 2e-4 学，慢到看起来像"辅助任务太难"。
+        if name.startswith(("rs_mi.", "rs_mr.", "region_head.")):
             proj_params.append(p)
         else:
             sos_params.append(p)
     params = sos_params + proj_params
     n_tr = sum(p.numel() for p in params)
     n_proj = sum(p.numel() for p in proj_params)
+    n_reg = sum(p.numel() for p in model.region_head.parameters())
     print(f"[train] 可训 {n_tr/1e6:.2f} M（SOS {n_tr/1e6 - n_proj/1e6:.2f} M"
-          f" + resampler {n_proj/1e6:.2f} M）  lr {args.lr} / {args.lr_proj}",
+          f" + resampler {n_proj/1e6 - n_reg/1e6:.2f} M"
+          f" + region_head {n_reg/1e6:.3f} M）  lr {args.lr} / {args.lr_proj}",
           flush=True)
     opt = torch.optim.AdamW([
         {"params": sos_params, "lr": args.lr},
@@ -577,13 +808,16 @@ def main() -> int:
                     chunk = [dict(r, mrna_window=shuffled_seq(r["mrna_window"], rng_s))
                              for r in chunk]
                 b = make_batch(chunk, tok, with_answer=False,
-                               n_soft=2 * args.n_query)
+                               n_soft=2 * args.n_query,
+                               acc=acc, acc_dim=acc_dim)
                 logits = model.predict(b)
                 # 「是」vs「否」的 logit 差作为正样本分数
                 scores += (logits[:, yes_id] - logits[:, no_id]).float().cpu().tolist()
                 labels += [r["label"] for r in chunk]
         model.train()
-        return auroc(scores, labels), len(rows)
+        auc = auroc(scores, labels)
+        mcc, thr = mcc_at_best_threshold(scores, labels)
+        return auc, mcc, thr, len(rows)
 
     # ---- checkpoint：保存可训参数 + 优化器，能真正续训 ----
     def trainable_state():
@@ -620,12 +854,30 @@ def main() -> int:
                     "不同任务的 checkpoint 不能接")
             if not ck.get("weights"):
                 raise SystemExit(f"{src} 没有 weights 字段，是旧格式的占位 checkpoint")
+            # 结构相关超参必须显式比对。只比张量数量时，n_query 4->16 数量不变，
+            # 会以 copy_ 的形状错误这种难懂的方式失败。
+            old_args = ck.get("args") or {}
+            for key, want in (("n_query", args.n_query),
+                              ("acc_dim", acc_dim)):
+                got = old_args.get(key)
+                if got is not None and got != want:
+                    raise SystemExit(
+                        f"{src} 的 {key}={got}，本次是 {want}；"
+                        "结构变了，不能续训（换 --tag 或从头训）")
         own = dict(model.named_parameters())
         loaded = 0
+        shape_bad = []
         for k, v in ck.get("weights", {}).items():
             if k in own:
+                if tuple(v.shape) != tuple(own[k].shape):
+                    shape_bad.append((k, tuple(v.shape), tuple(own[k].shape)))
+                    continue
                 own[k].data.copy_(v.to(own[k].device, own[k].dtype))
                 loaded += 1
+        if shape_bad:
+            k, a, b = shape_bad[0]
+            raise SystemExit(
+                f"{src} 的 {k} 形状 {a} 与模型 {b} 不一致（共 {len(shape_bad)} 处）")
         expect = sum(1 for _, p in model.named_parameters() if p.requires_grad)
         if loaded != expect:
             # 张量数对不上 = 结构不同（n_query / 替换层数 / preset 变了）。
@@ -644,15 +896,57 @@ def main() -> int:
             best = float(ck.get("auroc", -1.0))
             print(f"[resume] 从 step {start_step} 继续，best AUROC {best:.4f}", flush=True)
 
+    # ---- 批次组成 ----
+    # 类别先验必须保持 1:1，否则 yes/no 的 logit 偏置会漂移，AUROC 的变化
+    # 就分不清是"学得更好了"还是"阈值动了"。
+    pos_pool = [r for r in tr if r.get("label") == 1]
+    easy_pool = [r for r in tr if r.get("label") == 0]
+    hard_pool = list(hard)
+    if hard_pool:
+        hard_set = {(r["mirna"], r["mrna_window"]) for r in hard_pool}
+        easy_pool = [r for r in easy_pool
+                     if (r["mirna"], r["mrna_window"]) not in hard_set]
+    print(f"[mix] pos {len(pos_pool):,}  easy {len(easy_pool):,}  "
+          f"hard {len(hard_pool):,}  region {len(region_pool):,}", flush=True)
+
+    n_region = int(round(args.batch * args.region_frac))
+    n_target = args.batch - n_region
+    n_pos = n_target // 2
+    n_neg = n_target - n_pos
+    n_hard = int(round(n_neg * args.hard_frac)) if hard_pool else 0
+    n_easy = n_neg - n_hard
+    if args.hard_neg and not hard_pool:
+        n_easy, n_hard = n_neg, 0
+    print(f"[mix] 每批 {args.batch} = pos {n_pos} + easy {n_easy} + hard {n_hard}"
+          f" + region {n_region}", flush=True)
+    if n_hard and not hard_pool:
+        raise RuntimeError("请求了困难负样本但没有加载到任何 decoy")
+
+    def next_batch(step: int):
+        off = step * args.batch
+        chunk = [pos_pool[(off + j) % len(pos_pool)] for j in range(n_pos)]
+        chunk += [easy_pool[(off + j) % len(easy_pool)] for j in range(n_easy)]
+        if n_hard:
+            chunk += [hard_pool[(off + j) % len(hard_pool)] for j in range(n_hard)]
+        if n_region:
+            chunk += [region_pool[(off + j) % len(region_pool)]
+                      for j in range(n_region)]
+        random.Random(args.seed + step).shuffle(chunk)
+        return chunk
+
     print(f"\n=== 训练 {start_step + 1} .. {args.steps} 步 ===", flush=True)
     model.train()
     t0 = time.time()
     last_log = time.time()
     last_save = time.time()
     for step in range(start_step + 1, args.steps + 1):
-        chunk = [tr[(step * args.batch + j) % len(tr)] for j in range(args.batch)]
-        b = make_batch(chunk, tok, n_soft=2 * args.n_query)
-        loss = model.forward(b)
+        chunk = next_batch(step)
+        b = make_batch(chunk, tok, n_soft=2 * args.n_query,
+                       acc=acc, acc_dim=acc_dim)
+        out = model.forward(b)
+        loss = out["target"]
+        if "region" in out:
+            loss = loss + args.region_coef * out["region"]
         l_sos = (pen_fn(model.llm) * args.sos_ortho_coef
                  if pen_fn is not None and args.sos_ortho_coef else None)
         total = loss if l_sos is None else loss + l_sos
@@ -663,17 +957,22 @@ def main() -> int:
         if step % max(1, args.log_every) == 0:
             now = time.time()
             sos_txt = "" if l_sos is None else f"  sos {float(l_sos):.4f}"
-            print(f"  step {step:>5}  ce {float(loss):.4f}{sos_txt}  "
+            reg_txt = (f"  region {float(out['region']):.4f}"
+                       if "region" in out else "")
+            print(f"  step {step:>5}  ce {float(out['target']):.4f}{reg_txt}{sos_txt}  "
                   f"{args.log_every / max(now - last_log, 1e-6):.2f} 步/s  "
                   f"段内 {now - t0:.0f}s", flush=True)
             last_log = now
         if step % args.eval_every == 0 or step == args.steps:
-            auc, n = run_eval(args.eval_n)
-            print(f"  [eval@{step}] AUROC {auc:.4f}  (n={n}, 随机 0.5)", flush=True)
-            if auc > best:
-                best = auc
-                save_ckpt(ckdir / "best.pt", step, auc, with_optim=False)
-                print(f"  [best] 保存，AUROC {auc:.4f}", flush=True)
+            auc, mcc, thr, n = run_eval(args.eval_n)
+            print(f"  [eval@{step}] AUROC {auc:.4f}  MCC {mcc:.4f} (thr {thr:+.3f})"
+                  f"  (n={n}, 随机 AUROC 0.5 / MCC 0)", flush=True)
+            # 选 best 用 MCC：它同时看四个象限，比只看排序的 AUROC 更接近
+            # 「这个模型能不能真的判对」；AUROC 一并记录便于和历史对比。
+            if mcc > best:
+                best = mcc
+                save_ckpt(ckdir / "best.pt", step, mcc, with_optim=False)
+                print(f"  [best] 保存，MCC {mcc:.4f}（AUROC {auc:.4f}）", flush=True)
         due_steps = args.save_every > 0 and step % args.save_every == 0
         due_time = (args.save_minutes > 0
                     and time.time() - last_save >= 60.0 * args.save_minutes)
@@ -694,17 +993,18 @@ def main() -> int:
         rng.shuffle(perm_mi)
         perm_mr = list(range(n))
         rng.shuffle(perm_mr)
-        base, _ = run_eval(n)
-        p_mi, _ = run_eval(n, perm_mi=perm_mi)
-        p_mr, _ = run_eval(n, perm_mr=perm_mr)
-        s_mi, _ = run_eval(n, shuf_mi=True)
-        s_mr, _ = run_eval(n, shuf_mr=True)
-        print("\n[perturb] 输入扰动检验（都应该掉到 ~0.5）", flush=True)
-        print(f"  正常          AUROC {base:.4f}", flush=True)
-        print(f"  行置换 miRNA  AUROC {p_mi:.4f}", flush=True)
-        print(f"  行置换 mRNA   AUROC {p_mr:.4f}", flush=True)
-        print(f"  打乱 miRNA    AUROC {s_mi:.4f}", flush=True)
-        print(f"  打乱 mRNA     AUROC {s_mr:.4f}", flush=True)
+        base, base_m, _, _ = run_eval(n)
+        p_mi, p_mi_m, _, _ = run_eval(n, perm_mi=perm_mi)
+        p_mr, p_mr_m, _, _ = run_eval(n, perm_mr=perm_mr)
+        s_mi, s_mi_m, _, _ = run_eval(n, shuf_mi=True)
+        s_mr, s_mr_m, _, _ = run_eval(n, shuf_mr=True)
+        print("\n[perturb] 输入扰动检验（AUROC 应回 ~0.5，MCC 应回 ~0）", flush=True)
+        for tag, a, m in (("正常", base, base_m),
+                          ("行置换 miRNA", p_mi, p_mi_m),
+                          ("行置换 mRNA", p_mr, p_mr_m),
+                          ("打乱 miRNA", s_mi, s_mi_m),
+                          ("打乱 mRNA", s_mr, s_mr_m)):
+            print(f"  {tag:<14} AUROC {a:.4f}  MCC {m:.4f}", flush=True)
     return 0
 
 
