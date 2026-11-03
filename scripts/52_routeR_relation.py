@@ -705,6 +705,9 @@ def main() -> int:
         acc = AccCache(args.acc_cache, args.acc_idx)
         print(f"[acc] {acc.n:,} windows, dim {acc.dim}", flush=True)
     acc_dim = acc.dim if acc is not None else 0
+    # 写回 args，checkpoint 才会记住特征维度。不写的话续训守卫拿不到旧值，
+    # GGUF 评测器也会误判"没有可及性通道"。
+    args.acc_dim = acc_dim
 
     model = RelationModel(base_m, encoder, llm_dim=llm_dim,
                           enc_dim=encoder.hidden_size, n_query=args.n_query,
@@ -832,9 +835,13 @@ def main() -> int:
         return {n: p.detach().to("cpu")
                 for n, p in model.named_parameters() if p.requires_grad}
 
-    def save_ckpt(path, step, auc, with_optim=True):
+    def save_ckpt(path, step, auc, with_optim=True, mcc=None):
+        # auroc 保持原字段名（和 rel 时代兼容），MCC 单独存一份。
+        # 之前把 MCC 塞进 auroc 字段，读的人会以为那是 AUROC。
         blob = {"step": step, "args": vars(args), "auroc": auc,
                 "weights": trainable_state()}
+        if mcc is not None:
+            blob["mcc"] = mcc
         if with_optim:
             blob["optim"] = opt.state_dict()
         # 先写 .tmp 再原子改名：notebook 的同步线程每 60s 扫 step_*.pt 上传，
@@ -947,6 +954,7 @@ def main() -> int:
     t0 = time.time()
     last_log = time.time()
     last_save = time.time()
+    last_auc, last_mcc = None, None
     for step in range(start_step + 1, args.steps + 1):
         chunk = next_batch(step)
         b = make_batch(chunk, tok, n_soft=2 * args.n_query,
@@ -975,19 +983,22 @@ def main() -> int:
             last_log = now
         if step % args.eval_every == 0 or step == args.steps:
             auc, mcc, thr, n = run_eval(args.eval_n)
+            last_auc, last_mcc = auc, mcc
             print(f"  [eval@{step}] AUROC {auc:.4f}  MCC {mcc:.4f} (thr {thr:+.3f})"
                   f"  (n={n}, 随机 AUROC 0.5 / MCC 0)", flush=True)
             # 选 best 用 MCC：它同时看四个象限，比只看排序的 AUROC 更接近
             # 「这个模型能不能真的判对」；AUROC 一并记录便于和历史对比。
             if mcc > best:
                 best = mcc
-                save_ckpt(ckdir / "best.pt", step, mcc, with_optim=False)
+                save_ckpt(ckdir / "best.pt", step, auc, with_optim=False, mcc=mcc)
                 print(f"  [best] 保存，MCC {mcc:.4f}（AUROC {auc:.4f}）", flush=True)
         due_steps = args.save_every > 0 and step % args.save_every == 0
         due_time = (args.save_minutes > 0
                     and time.time() - last_save >= 60.0 * args.save_minutes)
         if due_steps or due_time:
-            save_ckpt(ckdir / f"step_{step:06d}.pt", step, best)
+            save_ckpt(ckdir / f"step_{step:06d}.pt", step,
+                      last_auc if last_auc is not None else -1.0,
+                      mcc=last_mcc)
             prune_steps()
             last_save = time.time()
 
