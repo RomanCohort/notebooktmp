@@ -118,8 +118,11 @@ def main() -> int:
     dev = r52.DEV
     enc = FakeEncoder().to(dev)
     base_m = FakeBase().to(dev)
+    # dtype 默认 bf16，和真实训练一致 —— 用 fp32 假模型测不出
+    # "region_head 是 fp32 而 sel 是 bf16" 这类错误。
     model = r52.RelationModel(base_m, enc, llm_dim=LLM_DIM, enc_dim=ENC_DIM,
-                              n_query=N_QUERY, acc_dim=ACC_DIM)
+                              n_query=N_QUERY, acc_dim=ACC_DIM,
+                              dtype=torch.bfloat16)
     model.rs_mi.to(dev); model.rs_mr.to(dev); model.region_head.to(dev)
 
     out = model.forward(b)

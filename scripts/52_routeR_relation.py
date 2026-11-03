@@ -116,7 +116,9 @@ class RelationModel(nn.Module):
         self.n_query = n_query
         # 区域四分类辅助头。只在训练时用，predict() 不碰它，
         # 导出 GGUF 时也不会出现在模型里。
-        self.region_head = nn.Linear(llm_dim, n_region)
+        # dtype 必须跟随底座：sel 来自 bf16 的 LLM hidden，float32 的 Linear
+        # 会直接抛 "mat1 and mat2 must have the same dtype"。
+        self.region_head = nn.Linear(llm_dim, n_region).to(dtype)
         self.encoder.eval()
 
     def train(self, mode: bool = True):
@@ -207,7 +209,10 @@ class RelationModel(nn.Module):
                 f"pred_pos {int(pos.max())} 越过序列长度 {hs.shape[1]}："
                 "make_batch 的下标口径和拼接顺序不一致")
         sel = hs[torch.arange(B, device=hs.device), pos]       # [B, llm_dim]
-        logits = head(sel).float()                             # [B, V]
+        # 两个头各自对齐自己的 dtype：真实模型里 lm_head 与 region_head 都是
+        # bf16，但这里显式转换一次，免得换底座（或跑 fp32 冒烟测试）时炸在
+        # "mat1 and mat2 must have the same dtype"。
+        logits = head(sel.to(head.weight.dtype)).float()       # [B, V]
 
         # 6) 两个头：靶向二分类为主，区域四分类为辅助
         is_reg = batch.get("is_region")
@@ -221,7 +226,8 @@ class RelationModel(nn.Module):
         reg_ids = batch["region_ids"][is_reg]
         if bool((reg_ids >= 0).all()):
             out["region"] = F.cross_entropy(
-                self.region_head(sel[is_reg]), reg_ids)
+                self.region_head(sel[is_reg].to(self.region_head.weight.dtype)),
+                reg_ids)
         if "target" not in out:
             out["target"] = logits.sum() * 0.0      # 整批都是 region 时的占位
         return out
@@ -249,7 +255,7 @@ class RelationModel(nn.Module):
         B = hs.shape[0]
         pos = batch["pred_pos"].clamp(min=0)
         sel = hs[torch.arange(B, device=hs.device), pos]
-        return head(sel).float()                              # [B, V]
+        return head(sel.to(head.weight.dtype)).float()        # [B, V]
 
 
 # ---------------------------------------------------------------- 数据
@@ -946,7 +952,9 @@ def main() -> int:
         out = model.forward(b)
         loss = out["target"]
         if "region" in out:
-            loss = loss + args.region_coef * out["region"]
+            # region_head 在 bf16 下算出来的 CE 仍是 fp32（cross_entropy 内部
+            # 会升精度），但显式转一次，避免和 target 相加时出现精度混杂。
+            loss = loss + args.region_coef * out["region"].float()
         l_sos = (pen_fn(model.llm) * args.sos_ortho_coef
                  if pen_fn is not None and args.sos_ortho_coef else None)
         total = loss if l_sos is None else loss + l_sos
