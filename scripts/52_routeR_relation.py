@@ -512,7 +512,9 @@ def make_batch(rows, tok, *, with_answer=True, n_soft=8, acc=None, acc_dim=0):
             if vec is None:
                 raise RuntimeError(
                     f"可及性缓存里没有这个窗口（第 {i} 行）：{r['mrna_window'][:20]}…")
-            A[i] = torch.as_tensor(vec, dtype=torch.float32, device=DEV)
+            # vec 是 memmap 切片，只读；显式 copy 避免 "non-writable tensor" 警告
+            # 和潜在的未定义行为。
+            A[i] = torch.tensor(vec, dtype=torch.float32, device=DEV)
         out["acc"] = A
     return out
 
