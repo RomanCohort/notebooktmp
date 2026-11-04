@@ -168,12 +168,11 @@ class RelationModel(nn.Module):
         feat[:, 1:1 + n, 0] = acc
         return feat
 
-    def forward(self, batch):
-        """batch: dict(mi_seqs, mr_seqs, q_ids, q_mask, prefix_ids,
-                       suffix_ids, pred_pos, target_ids)
+    def forward_logits(self, batch):
+        """返回 [B, V] 的 logits，保留梯度。
 
-        pred_pos 是 [prefix][soft][suffix] 拼接后的**绝对下标**，指向生成提示的
-        最后一个 token；该位置的 hidden 预测下一位，即答案首 token。
+        listwise 排序训练需要逐候选打分（同一 group 内做 softmax），不能只拿
+        整批 CE。forward() 复用这条路径，行为与拆分前完全一致。
         """
         # 1) 两条序列各自编码（ERNIE 冻结）
         with torch.no_grad():
@@ -213,6 +212,16 @@ class RelationModel(nn.Module):
         # bf16，但这里显式转换一次，免得换底座（或跑 fp32 冒烟测试）时炸在
         # "mat1 and mat2 must have the same dtype"。
         logits = head(sel.to(head.weight.dtype)).float()       # [B, V]
+        return logits, sel
+
+    def forward(self, batch):
+        """batch: dict(mi_seqs, mr_seqs, q_ids, q_mask, prefix_ids,
+                       suffix_ids, pred_pos, target_ids)
+
+        pred_pos 是 [prefix][soft][suffix] 拼接后的**绝对下标**，指向生成提示的
+        最后一个 token；该位置的 hidden 预测下一位，即答案首 token。
+        """
+        logits, sel = self.forward_logits(batch)
 
         # 6) 两个头：靶向二分类为主，区域四分类为辅助
         is_reg = batch.get("is_region")
